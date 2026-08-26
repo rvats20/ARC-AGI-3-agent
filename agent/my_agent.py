@@ -191,6 +191,19 @@ class MyAgent(Agent):
         movable = [m for m in (1, 2, 3, 4) if m in avail] or [1,2,3,4]
         safe = [m for m in movable if (key, m) not in self.death_cells] or movable
 
+        # early-life probe: force-try each direction once so dir_map learns
+        if self.probe_left:
+            probe = [p for p in self.probe_left if p in safe]
+            if probe and self.steps <= 12:
+                act = probe.pop(0)
+                self.probe_left = [p for p in self.probe_left if p != act]
+                a = getattr(GameAction, f"ACTION{act}")
+                a.reasoning = {"why": "dir probe", "step": self.steps}
+                self.prev_action = act
+                self.path.append(act)
+                self.prev_grid = grid
+                return a
+
         act = self._pick(safe, key)
         a = getattr(GameAction, f"ACTION{act}")
         a.reasoning = {"why": "frontier", "life": self.lives, "steps": self.steps}
@@ -208,7 +221,26 @@ class MyAgent(Agent):
             self.best_path = list(self.path)
 
     def _pick(self, candidates, key) -> int:
+        """Frontier pick with commitment: prefer directions into unvisited
+        cells, but commit to the chosen corridor for a run of steps so we
+        actually REACH new regions instead of oscillating at the boundary.
+        Between lives, rotate the preferred direction so successive lives
+        explore different quadrants."""
         known = {a: d for a, d in self.dir_map.items() if a in candidates}
+
+        # rotate exploration bias each life
+        if not hasattr(self, "_bias_idx") or self._bias_life != self.lives:
+            self._bias_life = self.lives
+            dirs = [a for a in (1, 2, 3, 4) if a in known]
+            self._bias_act = (dirs[self.lives % len(dirs)]
+                              if dirs else random.choice(candidates))
+
+        # while the biased action keeps moving us into unvisited cells,
+        # stick with it (commit phase)
+        if getattr(self, "_commit", 0) > 0 and self._bias_act in candidates:
+            self._commit -= 1
+            return self._bias_act
+
         best, best_score = None, None
         for act, d in known.items():
             t = (max(0, min(63, key[0]+d[0]*5)), max(0, min(63, key[1]+d[1]*5)))
@@ -216,6 +248,14 @@ class MyAgent(Agent):
             s = 0 if tk not in self.world_visited else 40
             if (tk, act) in self.death_cells:
                 s += 200
+            if act == getattr(self, "_bias_act", None):
+                s -= 10  # mild preference for this life's bias
             if best_score is None or s < best_score:
                 best_score, best = s, act
-        return best if best is not None else random.choice(candidates)
+
+        if best is not None:
+            # found an unvisited target -> commit to it for several steps
+            if best_score <= 10:
+                self._commit = 5
+            return best
+        return random.choice(candidates)
