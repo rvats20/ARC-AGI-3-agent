@@ -155,20 +155,29 @@ def build() -> dict:
         import os, subprocess, glob, time
 
         def _find_model_dir():
-            for d in glob.glob('/kaggle/input/*'):
-                if os.path.isfile(os.path.join(d, 'config.json')) and \\
-                   (glob.glob(os.path.join(d, '*.safetensors')) or
-                    glob.glob(os.path.join(d, 'layers-*.safetensors'))):
-                    return d
+            # Recursively find a dir that holds a HF model: config.json plus
+            # at least one safetensors shard. Weights may be nested under the
+            # dataset root, so walk (bounded depth) rather than only top-level.
+            import os as _os
+            for top in glob.glob('/kaggle/input/*'):
+                for root, _, files in _os.walk(top):
+                    if 'config.json' in files and any(
+                        f.endswith('.safetensors') for f in files
+                    ):
+                        return root
             return None
 
         def _find_wheelhouse():
-            for d in glob.glob('/kaggle/input/*'):
-                if os.path.isdir(os.path.join(d, 'wheels')):
-                    return d
+            import os as _os
+            for top in glob.glob('/kaggle/input/*'):
+                for root, dirs, _ in _os.walk(top):
+                    if 'wheels' in dirs:
+                        return root
             return None
 
         if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
+            print('Mounted /kaggle/input entries:',
+                  sorted(glob.glob('/kaggle/input/*')))
             model_dir = _find_model_dir()
             wh = _find_wheelhouse()
             if not model_dir:
