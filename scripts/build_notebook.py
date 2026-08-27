@@ -28,7 +28,7 @@ from textwrap import dedent
 #   "rtx6000"  — Nvidia RTX 6000 (g4-standard-48). ARC-AGI-3 exclusive,
 #                burns GPU quota faster — use only when you're confident.
 # ─────────────────────────────────────────────────────────────────────────────
-ACCELERATOR = "t4"
+ACCELERATOR = "rtx6000"
 
 # Internal mapping; don't edit unless Kaggle adds new options.
 _ACCELERATORS = {
@@ -90,13 +90,17 @@ def build() -> dict:
             !cp -r /kaggle/input/competitions/arc-prize-2026-arc-agi-3/ARC-AGI-3-Agents \\
                    /kaggle/working/ARC-AGI-3-Agents
 
-            # Drop our agent in as a framework template.
+            # Drop our agents in as framework templates.
             !cp /tmp/my_agent.py \\
                 /kaggle/working/ARC-AGI-3-Agents/agents/templates/my_agent.py
+            !cp /tmp/qwen_agent.py \\
+                /kaggle/working/ARC-AGI-3-Agents/agents/templates/qwen_agent.py
 
-            # Register MyAgent in the framework's agent registry. We rewrite
+            # Register agents in the framework's agent registry. We rewrite
             # __init__.py because the upstream version eagerly imports
             # templates with deps we don't ship (langgraph, smolagents, etc.).
+            # QwenAgent subclasses the heuristic MyAgent and falls back to it
+            # when no vLLM endpoint is reachable.
             with open('/kaggle/working/ARC-AGI-3-Agents/agents/__init__.py', 'w') as f:
                 f.write(\"\"\"from typing import Type
         from dotenv import load_dotenv
@@ -104,12 +108,13 @@ def build() -> dict:
         from .swarm import Swarm
         from .templates.random_agent import Random
         from .templates.my_agent import MyAgent
+        from .templates.qwen_agent import QwenAgent
 
         load_dotenv()
 
         AVAILABLE_AGENTS: dict[str, Type[Agent]] = {
             'random': Random,
-            'myagent': MyAgent,
+            'myagent': QwenAgent,
         }
         \"\"\")
 
@@ -126,12 +131,64 @@ def build() -> dict:
         \"\"\")
 
             # Run it. The gateway records every action and emits submission.parquet.
+            # QWEN_AGENT=1 enables the VLM agent; it self-falls-back to the
+            # heuristic explorer if the vLLM endpoint is not serving.
             !cd /kaggle/working/ARC-AGI-3-Agents && \\
                 MPLBACKEND=agg \\
+                QWEN_AGENT=1 \\
+                QWEN_BASE_URL=${QWEN_BASE_URL:-http://localhost:8000/v1} \\
+                QWEN_MODEL=${QWEN_MODEL:-Qwen/Qwen3-VL} \\
                 python main.py --agent myagent
         """
     )
     run_cell = code_cell(run_cell_source)
+
+    # Launch a local vLLM OpenAI-compatible server IF a model dataset is wired.
+    # The competition rerun has no internet, so the model + vLLM wheels must
+    # come from Kaggle datasets (e.g. the "TAAF Duck Qwen3.8 serving" dataset,
+    # or a wheelhouse dataset + a weights dataset). Set MODEL_DATASET (the
+    # Kaggle input slug, e.g. owner/qwen3-8-serving) to enable. If unset, the
+    # QwenAgent self-falls-back to the heuristic explorer.
+    serve_cell_source = dedent(
+        """\
+        import os, subprocess, time
+
+        MODEL_DATASET = os.getenv('MODEL_DATASET', '')
+        if os.getenv('KAGGLE_IS_COMPETITION_RERUN') and MODEL_DATASET:
+            model_dir = f'/kaggle/input/{MODEL_DATASET}'
+            print('Launching vLLM server from', model_dir)
+            wh = os.getenv('WHEELHOUSE_DATASET', '')
+            if wh:
+                !pip install --no-index --find-links /kaggle/input/$wh/wheels vllm 2>&1 | tail -3
+            model_name = os.getenv('QWEN_MODEL', 'Qwen/Qwen3-VL')
+            launcher = os.path.join(model_dir, 'serve.sh')
+            if os.path.exists(launcher):
+                serve_proc = subprocess.Popen(['bash', launcher],
+                                             env={**os.environ, 'MODEL_DIR': model_dir,
+                                                  'QWEN_MODEL': model_name})
+            else:
+                serve_proc = subprocess.Popen([
+                    'python', '-m', 'vllm.entrypoints.openai.api_server',
+                    '--model', model_name,
+                    '--tensor-parallel-size', os.getenv('VLLM_TP', '1'),
+                    '--max-model-len', os.getenv('VLLM_MAX_LEN', '8192'),
+                    '--dtype', 'auto', '--port', '8000',
+                ], env={**os.environ, 'VLLM_MODEL_DIR': model_dir})
+            import urllib.request
+            up = False
+            for _ in range(120):
+                try:
+                    urllib.request.urlopen('http://localhost:8000/v1/models', timeout=2)
+                    up = True
+                    break
+                except Exception:
+                    time.sleep(5)
+            print('vLLM server up:', up if up else 'did NOT come up; agent falls back to heuristic')
+            if not up:
+                serve_proc.terminate()
+        """
+    )
+    serve_cell = code_cell(serve_cell_source)
 
     dummy_submission_cell = code_cell(
         dedent(
@@ -191,6 +248,7 @@ def build() -> dict:
             install_cell,
             write_agent_cell,
             run_cell,
+            serve_cell,
             dummy_submission_cell,
         ],
     }

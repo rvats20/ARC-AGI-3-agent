@@ -15,6 +15,29 @@ final scorecard frame. This was also lost when the scripted branch was dropped
 between local revisions; it is now reinstated. Confirmed by `make play-local`:
 m0r0 → `levels=2, state=NOT_FINISHED, actions=38`.
 
+**VLM-in-the-loop agent added (2026-08-27):** `agent/qwen_agent.py` is a
+`QwenAgent(MyAgent)` that renders the current frame to a PNG and asks a
+locally-served multimodal model (Qwen3-VL / Qwen3.8) for a structured JSON
+action — the same approach as the milestone-winning "The Duck" (1.21% board).
+It falls back to the heuristic explorer whenever the vLLM endpoint is not
+serving, so the notebook always runs (CPU-friendly locally). Enable with
+`QWEN_AGENT=1` (already set in the submission notebook).
+
+**To actually run the VLM on Kaggle** (internet is OFF during the rerun, so the
+model + vLLM wheels must come from a dataset):
+1. Add the model dataset as a Kaggle input (`dataset_sources` in
+   `notebooks/kernel-metadata.json`), e.g. the "TAAF Duck Qwen3.8 serving v1"
+   dataset (weights + vLLM) or a wheelhouse dataset + a weights dataset.
+2. Set `MODEL_DATASET=<owner/slug>` (and optionally `WHEELHOUSE_DATASET`,
+   `QWEN_MODEL`, `VLLM_TP`) in the run env. The notebook's `serve_cell` then
+   installs vLLM offline and launches an OpenAI-compatible server on
+   `localhost:8000` before the agent plays. If unset, the agent uses the
+   heuristic fallback.
+
+Verified locally: `agent/qwen_agent.py` parses; `make play-local` runs the
+heuristic fallback (m0r0 → levels=2). The VLM path is exercised only on Kaggle
+where the model dataset is mounted.
+
 ## Hard-won engine facts (from live probing + reading obfuscated game code)
 
 1. **Frame format**: `[1][64][64]` — each cell is a 64-vector (one-hot palette
