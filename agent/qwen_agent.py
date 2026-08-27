@@ -109,18 +109,19 @@ class QwenAgent(MyAgent):
         self._enabled = os.environ.get("QWEN_AGENT", "1") == "1"
         self._history: list[dict] = []
         self._last_grid = None
-        # probe endpoint reachability once
+        # Create the client if enabled; don't hard-disable on a failed probe —
+        # vLLM may still be warming up when the agent is constructed (it loads
+        # ~24GB of weights). choose_action() retries per call and falls back to
+        # the heuristic on any connection error, so a slow start is tolerated.
         if self._enabled:
             try:
                 from openai import OpenAI
                 self._client = OpenAI(base_url=self._base_url,
                                       api_key=os.environ.get("QWEN_API_KEY", "EMPTY"))
-                # cheap health check
-                self._client.models.list(timeout=5)
-                logger.info(f"[QwenAgent] endpoint OK: {self._base_url} model={self._model}")
+                logger.info(f"[QwenAgent] client ready: {self._base_url} model={self._model}")
             except Exception as e:  # noqa: BLE001
-                logger.warning(f"[QwenAgent] endpoint unreachable ({e}); "
-                               f"falling back to heuristic explorer")
+                logger.warning(f"[QwenAgent] client init warning ({e}); "
+                               f"will retry per-call and fall back to heuristic")
                 self._client = None
 
     @property

@@ -143,49 +143,67 @@ def build() -> dict:
     )
     run_cell = code_cell(run_cell_source)
 
-    # Launch a local vLLM OpenAI-compatible server IF a model dataset is wired.
-    # The competition rerun has no internet, so the model + vLLM wheels must
-    # come from Kaggle datasets (e.g. the "TAAF Duck Qwen3.8 serving" dataset,
-    # or a wheelhouse dataset + a weights dataset). Set MODEL_DATASET (the
-    # Kaggle input slug, e.g. owner/qwen3-8-serving) to enable. If unset, the
-    # QwenAgent self-falls-back to the heuristic explorer.
+    # Launch a local vLLM OpenAI-compatible server from the model dataset that
+    # is mounted as a Kaggle input. The competition rerun has no internet, so
+    # the model weights + vLLM wheels must come from datasets. We auto-detect
+    # them by scanning /kaggle/input/* (works regardless of the exact slug you
+    # attached): the model dir holds config.json + *.safetensors; the wheelhouse
+    # holds a wheels/ folder. If nothing is mounted, QwenAgent self-falls back
+    # to the heuristic explorer.
     serve_cell_source = dedent(
         """\
-        import os, subprocess, time
+        import os, subprocess, glob, time
 
-        MODEL_DATASET = os.getenv('MODEL_DATASET', '')
-        if os.getenv('KAGGLE_IS_COMPETITION_RERUN') and MODEL_DATASET:
-            model_dir = f'/kaggle/input/{MODEL_DATASET}'
-            print('Launching vLLM server from', model_dir)
-            wh = os.getenv('WHEELHOUSE_DATASET', '')
-            if wh:
-                !pip install --no-index --find-links /kaggle/input/$wh/wheels vllm 2>&1 | tail -3
-            model_name = os.getenv('QWEN_MODEL', 'Qwen/Qwen3-VL')
-            launcher = os.path.join(model_dir, 'serve.sh')
-            if os.path.exists(launcher):
-                serve_proc = subprocess.Popen(['bash', launcher],
-                                             env={**os.environ, 'MODEL_DIR': model_dir,
-                                                  'QWEN_MODEL': model_name})
+        def _find_model_dir():
+            for d in glob.glob('/kaggle/input/*'):
+                if os.path.isfile(os.path.join(d, 'config.json')) and \\
+                   (glob.glob(os.path.join(d, '*.safetensors')) or
+                    glob.glob(os.path.join(d, 'layers-*.safetensors'))):
+                    return d
+            return None
+
+        def _find_wheelhouse():
+            for d in glob.glob('/kaggle/input/*'):
+                if os.path.isdir(os.path.join(d, 'wheels')):
+                    return d
+            return None
+
+        if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
+            model_dir = _find_model_dir()
+            wh = _find_wheelhouse()
+            if not model_dir:
+                print('No model dataset mounted under /kaggle/input -> '
+                      'QwenAgent will use the heuristic fallback.')
             else:
+                print('Model dir:', model_dir, '| wheelhouse:', wh)
+                if wh:
+                    !pip install --no-index --find-links {wh}/wheels vllm 2>&1 | tail -3
+                # vLLM registers the model under the --model path; export it so
+                # the agent (run in the next cell, same kernel) requests the
+                # exact same model id.
+                os.environ['QWEN_MODEL'] = model_dir
+                os.environ['QWEN_BASE_URL'] = 'http://localhost:8000/v1'
                 serve_proc = subprocess.Popen([
                     'python', '-m', 'vllm.entrypoints.openai.api_server',
-                    '--model', model_name,
+                    '--model', model_dir,
                     '--tensor-parallel-size', os.getenv('VLLM_TP', '1'),
                     '--max-model-len', os.getenv('VLLM_MAX_LEN', '8192'),
                     '--dtype', 'auto', '--port', '8000',
+                    '--enable-auto-tool-choice',
                 ], env={**os.environ, 'VLLM_MODEL_DIR': model_dir})
-            import urllib.request
-            up = False
-            for _ in range(120):
-                try:
-                    urllib.request.urlopen('http://localhost:8000/v1/models', timeout=2)
-                    up = True
-                    break
-                except Exception:
-                    time.sleep(5)
-            print('vLLM server up:', up if up else 'did NOT come up; agent falls back to heuristic')
-            if not up:
-                serve_proc.terminate()
+                import urllib.request
+                up = False
+                for _ in range(180):
+                    try:
+                        urllib.request.urlopen('http://localhost:8000/v1/models', timeout=2)
+                        up = True
+                        break
+                    except Exception:
+                        time.sleep(5)
+                print('vLLM server up:', up if up else
+                      'did NOT come up in time; agent falls back to heuristic')
+                if not up:
+                    serve_proc.terminate()
         """
     )
     serve_cell = code_cell(serve_cell_source)
