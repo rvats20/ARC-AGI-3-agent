@@ -56,17 +56,15 @@ def probe_game(arc, game_id, n_steps=8):
     # Probe first n steps with each action to see what changes
     from arcengine import GameAction
     avail = out["available_actions"] or [1, 2, 3, 4]
-    # Coerce each int to its corresponding GameAction (covers available_actions
-    # being ints, enums, or strings).
+    # BUGFIX: GameAction is an Enum-like; GameAction(int) raises ValueError.
+    # Build a value->enum lookup and match by .value instead.
+    _VAL2ENUM = {ga.value: ga for ga in GameAction}
     avail_enums = []
     for a in avail:
         if isinstance(a, GameAction):
             avail_enums.append(a)
-        elif isinstance(a, int):
-            try:
-                avail_enums.append(GameAction(a))
-            except ValueError:
-                pass
+        elif isinstance(a, int) and a in _VAL2ENUM:
+            avail_enums.append(_VAL2ENUM[a])
         elif isinstance(a, str):
             try:
                 avail_enums.append(GameAction[a])
@@ -78,11 +76,25 @@ def probe_game(arc, game_id, n_steps=8):
     action_effects = {}
     for ga in avail_enums:
         env.reset()
+        # For click actions (A5/6/7), pass plausible data so the engine doesn't
+        # crash and so we measure the *real* state change, not "no target".
+        if ga.name in ("ACTION5", "ACTION6", "ACTION7") and ga is not GameAction.RESET:
+            try:
+                # Click near center (most sprites cluster there in ARC-AGI-3)
+                ga.set_data({"x": 32, "y": 32})
+            except Exception:
+                pass
         env.step(ga)
         f1 = env.observation_space  # FrameDataRaw
         g1 = normalize_grid(f1.frame)
         if g0 and g1:
-            diff = [(r, c) for r in range(64) for c in range(64) if g0[r][c] != g1[r][c]]
+            # Some games produce non-64x64 grids after a step (e.g. tu93
+            # ACTION4 -> 8x64). Use min shape to avoid index errors.
+            h = min(len(g0), len(g1))
+            w = min(len(g0[0]) if g0 and g0[0] else 0,
+                    len(g1[0]) if g1 and g1[0] else 0)
+            diff = [(r, c) for r in range(h) for c in range(w)
+                    if g0[r][c] != g1[r][c]]
             action_effects[ga.name] = {
                 "diff_cells": len(diff),
                 "sample_diff": diff[:5],
@@ -109,17 +121,33 @@ def main():
     for gid in target_ids:
         try:
             info = probe_game(arc, gid)
-            # Don't serialize the full grid in the summary, just key bits
-            summary = {k: v for k, v in info.items() if k != "initial_grid"}
+            # v9: keep the full initial_grid for sprite analysis (click targets)
+            summary = dict(info)
             summary["initial_grid_size"] = (len(info["initial_grid"]),
                                               len(info["initial_grid"][0]) if info["initial_grid"] else 0)
             summary["initial_grid_palette_size"] = len(info["initial_palette"])
+            # For each non-background color, record how many cells use it
+            # and a few representative (row,col) positions — these become the
+            # click-game "sprite targets" instead of Halton scatter.
+            if info["initial_grid"]:
+                from collections import defaultdict
+                by_color = defaultdict(list)
+                for r, row in enumerate(info["initial_grid"]):
+                    for c, v in enumerate(row):
+                        if v != 0:  # 0 = background (per palette convention)
+                            by_color[v].append((r, c))
+                summary["color_cell_counts"] = {int(k): len(v) for k, v in by_color.items()}
+                summary["color_sample_cells"] = {int(k): v[:5] for k, v in by_color.items()}
+            else:
+                summary["color_cell_counts"] = {}
+                summary["color_sample_cells"] = {}
             out.append(summary)
             print(f"  {gid}: palette_size={summary['initial_grid_palette_size']}, "
                   f"avail={summary['available_actions']}, "
-                  f"action_effects={ {a: info['action_effects'][a]['diff_cells'] for a in info['action_effects']} }")
-        except Exception as e:
-            print(f"  {gid}: ERROR {e}")
+                  f"effects={ {a: info['action_effects'][a]['diff_cells'] for a in info['action_effects']} }, "
+                  f"colors={summary['color_cell_counts']}")
+        except Exception as ase:
+            print(f"  {gid}: ERROR {ase}")
     Path(args.out).parent.mkdir(exist_ok=True)
     Path(args.out).write_text(json.dumps(out, indent=2, default=str))
     print(f"\nWrote {len(out)} game probes to {args.out}")
