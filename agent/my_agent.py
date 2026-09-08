@@ -350,9 +350,11 @@ class MyAgent(Agent):
         if grid is None or self.pos is None:
             return
         py, px = self.pos
+        h = len(grid)
+        w = len(grid[0]) if h > 0 else 0
         # Only scan a region around the player to avoid picking up distant background walls
-        for r in range(max(0, py - 20), min(64, py + 20)):
-            for c in range(max(0, px - 20), min(64, px + 20)):
+        for r in range(max(0, py - 20), min(h, py + 20)):
+            for c in range(max(0, px - 20), min(w, px + 20)):
                 val = grid[r][c]
                 if val in (3, 4):  # Wall colors
                     cell_key = (r // self.cell_size * self.cell_size, c // self.cell_size * self.cell_size)
