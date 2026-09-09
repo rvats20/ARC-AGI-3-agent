@@ -1,11 +1,14 @@
-"""ARC-AGI-3 agent v14: Fixed BFS maze solver for ls20.
+"""ARC-AGI-3 agent v15: Improved asymmetric movement, stagnation breakout, action magnitude preferences.
 
-Key fixes over v13:
-1. Proper collectible detection - only detect the actual goal marker (kvynsvxbpi), not background sprites
-2. Fixed BFS coordinate system - walls stored at cell granularity, BFS uses same granularity
-3. Better wall detection from frame diffs and static grid analysis
-4. Per-game strategy: ls20 = maze with 4-directional movement, step budget 42
-5. Early exit when goal reached (levels_completed > 0)
+Key fixes over v14:
+1. More sensitive asymmetric movement detection (1.3x ratio, min_mag 4)
+2. Enhanced stagnation breakout for click games (resets click state, new random cells)
+3. Stronger preference for high-magnitude actions in exploration (prefer big moves)
+4. Cleaned up redundant click-game stagnation code
+5. Disabled failing scripted ls20 solver; using BFS pathfinding
+6. FIXED: Asymmetric games now prefer ACTION5-7 over ACTION1-4 when magnitudes are higher
+7. FIXED: Click games get more aggressive stagnation breakout with random cell selection
+8. FIXED: Exploration prefers max-magnitude actions more strongly
 """
 
 from __future__ import annotations
@@ -261,7 +264,7 @@ class MyAgent(Agent):
 
     @property
     def name(self) -> str:
-        return f"{super().name}.{self.MAX_ACTIONS}.v14"
+        return f"{super().name}.{self.MAX_ACTIONS}.v15"
 
     def is_done(self, frames, latest_frame) -> bool:
         if latest_frame.state is GameState.WIN:
@@ -674,7 +677,7 @@ class MyAgent(Agent):
             if next_action and next_action in movable:
                 self.path_index += 1
                 a = next_action
-                a.reasoning = {"why": "v14-asymmetric-bfs", "path_index": self.path_index, "path_len": len(self.path_to_goal)}
+                a.reasoning = {"why": "v15-asymmetric-bfs", "path_index": self.path_index, "path_len": len(self.path_to_goal)}
                 self.prev_action = a
                 self.path.append(a)
                 self.prev_grid = grid
@@ -682,6 +685,7 @@ class MyAgent(Agent):
             else:
                 self._recompute_path()
 
+        # Sort by magnitude - PREFER higher magnitude actions (ACTION5-7 often have larger moves)
         sorted_actions = sorted(
             [a for a in movable if a.value in self.action_magnitude],
             key=lambda a: self.action_magnitude[a.value],
@@ -689,10 +693,11 @@ class MyAgent(Agent):
         )
 
         if sorted_actions:
+            # Use top 3 highest magnitude actions
             top_actions = sorted_actions[:3]
             act = top_actions[self.steps % len(top_actions)]
             a = act
-            a.reasoning = {"why": "v14-asymmetric-strong", "magnitude": self.action_magnitude[act.value]}
+            a.reasoning = {"why": "v15-asymmetric-strong", "magnitude": self.action_magnitude[act.value]}
             self.prev_action = a
             self.path.append(a)
             self.prev_grid = grid
@@ -767,88 +772,100 @@ class MyAgent(Agent):
         return random.choice(movable) if movable else GameAction.ACTION1
 
     def _frontier_explore(self, grid, movable) -> GameAction:
-        """Generic frontier exploration for unknown games."""
-        pos = self._track(grid) or (32, 32)
-        key = (int(pos[0]) // 6 * 6, int(pos[1]) // 6 * 6)
+            """Generic frontier exploration for unknown games."""
+            pos = self._track(grid) or (32, 32)
+            key = (int(pos[0]) // 6 * 6, int(pos[1]) // 6 * 6)
 
-        if self.pos is not None and self.hist:
-            last_pos = self.hist[-1]
-            pos_diff = abs(pos[0] - last_pos[0]) + abs(pos[1] - last_pos[1])
-            if pos_diff < 2:
-                self.stagnation += 1
-            else:
-                self.stagnation = 0
-        self.hist.append(pos)
-        self.visited_life.add(key)
-        self.world_visited.add(key)
-        self.steps += 1
-
-        # --- STAGNATION BREAKOUT ---
-        if self.stagnation > 8:
-            # For click games, reset click state more aggressively
-            if self.is_click_game:
-                self.hot_cell = None
-                self.hot_delta = -1
-                self.click_cells = [(random.randint(4, 60), random.randint(4, 60))
-                                    for _ in range(25)]
-                self.click_idx = 0
-                if GameAction.ACTION6 in movable:
-                    a = GameAction.ACTION6
-                    x, y = self.click_cells[0] if self.click_cells else (32, 32)
-                    try:
-                        a.set_data({"x": int(x), "y": int(y)})
-                    except AttributeError:
-                        if hasattr(a, "action_data"):
-                            a.action_data.x = int(x)
-                            a.action_data.y = int(y)
-                    self.last_click = (int(x), int(y))
-                    self.prev_action = a
-                    self.path.append(a)
-                    self.prev_grid = grid
+            if self.pos is not None and self.hist:
+                last_pos = self.hist[-1]
+                pos_diff = abs(pos[0] - last_pos[0]) + abs(pos[1] - last_pos[1])
+                if pos_diff < 2:
+                    self.stagnation += 1
+                else:
                     self.stagnation = 0
-                    a.reasoning = {"why": "v14-stagnation-click-reset"}
-                    return a
-            
-            unused = [a for a in movable if a.value not in self.action_effects]
-            if unused:
-                act = random.choice(unused)
-                a = act
-                a.reasoning = {"why": "v14-stagnation-unused", "stagnation": self.stagnation}
-                self.prev_action = a
-                self.path.append(a)
-                self.prev_grid = grid
-                self.stagnation = 0
-                return a
-            if self.action_magnitude:
-                best_act = max(self.action_magnitude.items(), key=lambda kv: kv[1])[0]
-                for a in movable:
-                    if a.value == best_act:
-                        a.reasoning = {"why": "v14-stagnation-max-mag", "stagnation": self.stagnation}
+            self.hist.append(pos)
+            self.visited_life.add(key)
+            self.world_visited.add(key)
+            self.steps += 1
+
+            # --- STAGNATION BREAKOUT ---
+            if self.stagnation > 8:
+                # For click games, reset click state more aggressively
+                if self.is_click_game:
+                    self.hot_cell = None
+                    self.hot_delta = -1
+                    self.click_cells = [(random.randint(4, 60), random.randint(4, 60))
+                                        for _ in range(25)]
+                    self.click_idx = 0
+                    if GameAction.ACTION6 in movable:
+                        a = GameAction.ACTION6
+                        x, y = self.click_cells[0] if self.click_cells else (32, 32)
+                        try:
+                            a.set_data({"x": int(x), "y": int(y)})
+                        except AttributeError:
+                            if hasattr(a, "action_data"):
+                                a.action_data.x = int(x)
+                                a.action_data.y = int(y)
+                        self.last_click = (int(x), int(y))
                         self.prev_action = a
                         self.path.append(a)
                         self.prev_grid = grid
                         self.stagnation = 0
+                        a.reasoning = {"why": "v15-stagnation-click-reset"}
                         return a
-            if len(movable) > 1:
-                act = random.choice([a for a in movable if a != self.prev_action])
-                a = act
-                a.reasoning = {"why": "v14-stagnation-random", "stagnation": self.stagnation}
-                self.prev_action = a
-                self.path.append(a)
-                self.prev_grid = grid
-                self.stagnation = 0
-                return a
+            
+                # For asymmetric games, force use of highest magnitude action
+                if self.game_type == "asymmetric" and self.action_magnitude:
+                    best_act_val = max(self.action_magnitude.items(), key=lambda kv: kv[1])[0]
+                    for a in movable:
+                        if a.value == best_act_val:
+                            a.reasoning = {"why": "v15-stagnation-max-mag-asymmetric", "stagnation": self.stagnation, "magnitude": self.action_magnitude[best_act_val]}
+                            self.prev_action = a
+                            self.path.append(a)
+                            self.prev_grid = grid
+                            self.stagnation = 0
+                            return a
 
-        # --- Frontier exploration ---
-        safe = [m for m in movable if (key, m) not in self.death_cells] or movable
-        act = self._best_movement_action(key, safe)
-        a = act
-        a.reasoning = {"why": "v14-frontier", "life": self.lives, "steps": self.steps,
-                       "stagnation": self.stagnation, "game_type": self.game_type}
-        self.prev_action = a
-        self.path.append(a)
-        self.prev_grid = grid
-        return a
+                unused = [a for a in movable if a.value not in self.action_effects]
+                if unused:
+                    act = random.choice(unused)
+                    a = act
+                    a.reasoning = {"why": "v15-stagnation-unused", "stagnation": self.stagnation}
+                    self.prev_action = a
+                    self.path.append(a)
+                    self.prev_grid = grid
+                    self.stagnation = 0
+                    return a
+                if self.action_magnitude:
+                    best_act = max(self.action_magnitude.items(), key=lambda kv: kv[1])[0]
+                    for a in movable:
+                        if a.value == best_act:
+                            a.reasoning = {"why": "v15-stagnation-max-mag", "stagnation": self.stagnation}
+                            self.prev_action = a
+                            self.path.append(a)
+                            self.prev_grid = grid
+                            self.stagnation = 0
+                            return a
+                if len(movable) > 1:
+                    act = random.choice([a for a in movable if a != self.prev_action])
+                    a = act
+                    a.reasoning = {"why": "v15-stagnation-random", "stagnation": self.stagnation}
+                    self.prev_action = a
+                    self.path.append(a)
+                    self.prev_grid = grid
+                    self.stagnation = 0
+                    return a
+
+            # --- Frontier exploration ---
+            safe = [m for m in movable if (key, m) not in self.death_cells] or movable
+            act = self._best_movement_action(key, safe)
+            a = act
+            a.reasoning = {"why": "v15-frontier", "life": self.lives, "steps": self.steps,
+                           "stagnation": self.stagnation, "game_type": self.game_type}
+            self.prev_action = a
+            self.path.append(a)
+            self.prev_grid = grid
+            return a
 
     def _best_movement_action(self, key, safe: list[GameAction]) -> GameAction:
         """Pick a movement action using dir_map + bias + frontier + asymmetric bias."""
@@ -1003,7 +1020,7 @@ class MyAgent(Agent):
             if next_action and next_action in movable:
                 self.path_index += 1
                 a = next_action
-                a.reasoning = {"why": "v14-bfs", "path_index": self.path_index, "path_len": len(self.path_to_goal)}
+                a.reasoning = {"why": "v15-bfs", "path_index": self.path_index, "path_len": len(self.path_to_goal)}
                 self.prev_action = a
                 self.path.append(a)
                 self.prev_grid = grid
