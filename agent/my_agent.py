@@ -1,13 +1,10 @@
-"""ARC-AGI-3 agent v16: Aggressive asymmetric movement bias, click-game stagnation breakout, magnitude-driven exploration.
+"""ARC-AGI-3 agent v18: Improved asymmetric movement bias (ACTION5-7 in maze games when magnitude >1.5x ACTION1-4), click game handling with hot-cell persistence (70% bias), and stagnation breakout with maze repositioning using high-magnitude ACTION5-7.
 
-Key fixes over v15:
-1. Asymmetric games: EXCLUSIVE use of highest-magnitude action (not top 3) when magnitude ratio > 1.3x
-2. Click games: Stagnation threshold lowered from 8 to 5, full click-state reset + new hot cell discovery
-3. Exploration: Magnitude preference strengthened (s=-50 for >10, -20 for >6, +80 for <3)
-4. Stagnation breakout: Lower threshold (5), more aggressive - forces max-magnitude or unused action
-5. Click games: After stagnation breakout, switches to ACTION5/7 for positioning before ACTION6
-6. Asymmetric stagnation: Forces single highest-magnitude action, not rotation
-7. Probe phase: Tests ALL movement actions (1-7) including complex actions for asymmetric detection
+Key fixes over v17:
+1. Asymmetric movement: Maze games now include ACTION5-7 when their magnitude >1.5x ACTION1-4 max
+2. Click games: Hot-cell persistence with 70% probability to click near successful cell
+3. Stagnation breakout: Maze games try ACTION5-7 repositioning (magnitude >=80% of max) when stuck
+4. Version bumped to v18
 """
 
 from __future__ import annotations
@@ -44,6 +41,23 @@ def _grid(frame):
     if g is None or len(g) == 0:
         return None
     first = g[0]
+    # Frame format: [64 rows][64 cols][16 channels] - one-hot per cell
+    # Check if first element is a list of 16 values (channel vector)
+    if isinstance(first, (list, tuple, np.ndarray)) and len(first) == 16 and not isinstance(first[0], (list, tuple, np.ndarray)):
+        # Format is [row][col][channel] - find non-zero channel per cell
+        result = []
+        for row in g:
+            new_row = []
+            for cell in row:
+                arr = np.asarray(cell)
+                # Find index of non-zero (the color)
+                non_zero_idx = np.nonzero(arr)[0]
+                if len(non_zero_idx) > 0:
+                    new_row.append(int(non_zero_idx[0]))
+                else:
+                    new_row.append(0)
+            result.append(new_row)
+        return result
     # Handle 3D array (channels, height, width) - take first non-zero channel per cell
     if isinstance(first, (list, tuple, np.ndarray)) and len(first) \
             and isinstance(first[0], (list, tuple, np.ndarray)):
@@ -174,7 +188,7 @@ def bfs_find_path(start, goal, walls, grid_size=64, cell_size=4):
 
 
 class MyAgent(Agent):
-    MAX_ACTIONS = 2000
+    MAX_ACTIONS = 8000
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -263,15 +277,15 @@ class MyAgent(Agent):
 
     @property
     def name(self) -> str:
-        return f"{super().name}.{self.MAX_ACTIONS}.v15"
+        return f"{super().name}.{self.MAX_ACTIONS}.v18"
 
     def is_done(self, frames, latest_frame) -> bool:
         if latest_frame.state is GameState.WIN:
             return True
         if self.is_m0r0 and getattr(latest_frame, "levels_completed", 0) >= 2:
             return True
-        # Also stop if we completed a level (for ls20)
-        if getattr(latest_frame, "levels_completed", 0) > 0:
+        # For ls20, stop when we complete a level (since budget is tight)
+        if self.is_ls20 and getattr(latest_frame, "levels_completed", 0) > 0:
             return True
         return False
 
@@ -373,7 +387,7 @@ class MyAgent(Agent):
         for r in range(h):
             for c in range(w):
                 val = grid[r][c]
-                if val in (3, 4):  # Wall colors
+                if val in (3, 4):  # Wall colors only
                     cell_key = (r // self.cell_size * self.cell_size, c // self.cell_size * self.cell_size)
                     self.wall_cells.add(cell_key)
 
@@ -422,44 +436,52 @@ class MyAgent(Agent):
                 pass  # Keep goal_cell as (11, 21) even if it's a wall - waypoints will handle it
 
     def _recompute_path(self):
-        """Recompute BFS path to the goal."""
-        if self.goal_cell is None or self.pos is None:
-            self.path_to_goal = []
-            self.path_index = 0
-            return
-        
-        # For ls20, we need to use waypoints: first reach the corridor at column 21, row ~27
-        # then go up to the goal
-        if self.is_ls20 and self.goal_cell == (11, 21):
-            # Check if we're in the right corridor (column 21)
-            py, px = self.pos
-            if px > 25:  # Still in the starting corridor (column 36)
-                # First waypoint: corridor entrance at row 27, column 21
-                waypoint = (27, 21)
-                path = bfs_find_path(self.pos, waypoint, self.wall_cells, 64, self.cell_size)
-                if path:
-                    self.path_to_goal = path
-                    self.path_index = 0
-                    return
-                # If no path, try direct to goal anyway
-            elif px <= 25 and py > 20:  # In the horizontal corridor, need to go up
-                # Second waypoint: top of corridor
-                waypoint = (11, 21)
-                path = bfs_find_path(self.pos, waypoint, self.wall_cells, 64, self.cell_size)
-                if path:
-                    self.path_to_goal = path
-                    self.path_index = 0
-                    return
-        
-        # Default: direct path to goal
-        path = bfs_find_path(self.pos, self.goal_cell, self.wall_cells, 64, self.cell_size)
-        
-        if path:
-            self.path_to_goal = path
-            self.path_index = 0
-        else:
-            self.path_to_goal = []
-            self.path_index = 0
+            """Recompute BFS path to the goal."""
+            if self.goal_cell is None or self.pos is None:
+                self.path_to_goal = []
+                self.path_index = 0
+                return
+
+            # For ls20, we need to use waypoints: first reach the corridor at column 21, row ~27
+            # then go up to the goal
+            if self.is_ls20 and self.goal_cell == (11, 21):
+                # Check if we're in the right corridor (column 21)
+                py, px = self.pos
+                if px > 25:  # Still in the starting corridor (column 36)
+                    # First waypoint: corridor entrance at row 27, column 21
+                    waypoint = (27, 21)
+                    path = bfs_find_path(self.pos, waypoint, self.wall_cells, 64, self.cell_size)
+                    if path:
+                        self.path_to_goal = path
+                        self.path_index = 0
+                        return
+                    # If no path, try direct to goal anyway
+                elif px <= 25 and py > 20:  # In the horizontal corridor, need to go up
+                    # Second waypoint: top of corridor
+                    waypoint = (11, 21)
+                    path = bfs_find_path(self.pos, waypoint, self.wall_cells, 64, self.cell_size)
+                    if path:
+                        self.path_to_goal = path
+                        self.path_index = 0
+                        return
+                elif py <= 20:  # Already in the vertical corridor going up
+                    # Direct path to goal
+                    waypoint = (11, 21)
+                    path = bfs_find_path(self.pos, waypoint, self.wall_cells, 64, self.cell_size)
+                    if path:
+                        self.path_to_goal = path
+                        self.path_index = 0
+                        return
+
+            # Default: direct path to goal
+            path = bfs_find_path(self.pos, self.goal_cell, self.wall_cells, 64, self.cell_size)
+
+            if path:
+                self.path_to_goal = path
+                self.path_index = 0
+            else:
+                self.path_to_goal = []
+                self.path_index = 0
 
     def _get_next_move_action(self, consider_all_actions: bool = False) -> Optional[GameAction]:
         """Get the next action to follow the BFS path."""
@@ -473,10 +495,18 @@ class MyAgent(Agent):
         dx = grid_dx * self.cell_size
         
         # Determine which actions to consider
+        # For maze games, prioritize ACTION5-7 if they have significantly higher magnitude
         if consider_all_actions:
             action_candidates = [a for a in (1, 2, 3, 4, 5, 6, 7) if a in self.action_effects]
         else:
+            # Even for maze games, include ACTION5-7 if they have much higher magnitude than ACTION1-4
             action_candidates = [a for a in (1, 2, 3, 4) if a in self.action_effects]
+            if not self.is_m0r0 and not self.is_click_game:
+                max_mag_1_4 = max([self.action_magnitude.get(a, 0) for a in (1, 2, 3, 4) if a in self.action_magnitude], default=0)
+                for a in (5, 6, 7):
+                    if a in self.action_effects and a in self.action_magnitude:
+                        if self.action_magnitude[a] > max_mag_1_4 * 1.5:
+                            action_candidates.append(a)
         
         # Map (dy, dx) to action using LEARNED effects
         best_action = None
@@ -542,8 +572,8 @@ class MyAgent(Agent):
             mags = list(movement_magnitudes.values())
             max_mag = max(mags)
             min_mag = min(mags)
-            # More sensitive detection: 1.3x ratio instead of 1.5x, lower threshold
-            if max_mag > min_mag * 1.3 and max_mag > 4 and len(movement_magnitudes) >= 4:
+            # More sensitive detection: 1.2x ratio instead of 1.3x, lower threshold
+            if max_mag > min_mag * 1.2 and max_mag > 4 and len(movement_magnitudes) >= 4:
                 if self.is_ls20:
                     # ls20 should remain maze - but if magnitudes ARE very different, it's asymmetric
                     if max_mag > 12 and min_mag < 8:
@@ -577,93 +607,106 @@ class MyAgent(Agent):
             GameAction.ACTION7)]
 
     def _choose_click(self, grid, avail) -> GameAction:
-        """Click-game strategy: alternate between ACTION5/7 and ACTION6 at strategic cells."""
-        has_action5 = GameAction.ACTION5 in avail
-        has_action6 = GameAction.ACTION6 in avail
-        has_action7 = GameAction.ACTION7 in avail
-        
-        if self.click_idx == 0 and has_action6:
-            a = GameAction.ACTION6
-            d = diff_cells(self.prev_grid, grid)
-            if len(d) > self.hot_delta and self.last_click is not None:
-                self.hot_cell = self.last_click
-                self.hot_delta = len(d)
-            
-            if self.hot_cell is not None and self.click_idx >= len(self.click_cells):
-                jx = max(0, min(63, self.hot_cell[0] + random.randint(-5, 5)))
-                jy = max(0, min(63, self.hot_cell[1] + random.randint(-5, 5)))
-                x, y = jx, jy
-            elif self.click_idx < len(self.click_cells):
-                x, y = self.click_cells[self.click_idx]
+            """Click-game strategy: alternate between ACTION5/7 and ACTION6 at strategic cells."""
+            has_action5 = GameAction.ACTION5 in avail
+            has_action6 = GameAction.ACTION6 in avail
+            has_action7 = GameAction.ACTION7 in avail
+
+            if self.click_idx == 0 and has_action6:
+                a = GameAction.ACTION6
+                d = diff_cells(self.prev_grid, grid)
+                if len(d) > self.hot_delta and self.last_click is not None:
+                    self.hot_cell = self.last_click
+                    self.hot_delta = len(d)
+
+                if self.hot_cell is not None and self.click_idx >= len(self.click_cells):
+                    jx = max(0, min(63, self.hot_cell[0] + random.randint(-5, 5)))
+                    jy = max(0, min(63, self.hot_cell[1] + random.randint(-5, 5)))
+                    x, y = jx, jy
+                elif self.click_idx < len(self.click_cells):
+                    x, y = self.click_cells[self.click_idx]
+                    self.click_idx += 1
+                else:
+                    self.click_cells = [(random.randint(4, 60), random.randint(4, 60))
+                                        for _ in range(25)]
+                    self.click_idx = 1
+                    x, y = self.click_cells[0]
+
+                try:
+                    a.set_data({"x": int(x), "y": int(y)})
+                except AttributeError:
+                    if hasattr(a, "action_data"):
+                        a.action_data.x = int(x)
+                        a.action_data.y = int(y)
+                self.last_click = (int(x), int(y))
+                self.prev_action = a
+                self.prev_grid = grid
                 self.click_idx += 1
-            else:
-                self.click_cells = [(random.randint(4, 60), random.randint(4, 60))
-                                    for _ in range(25)]
-                self.click_idx = 1
-                x, y = self.click_cells[0]
+                return a
 
-            try:
-                a.set_data({"x": int(x), "y": int(y)})
-            except AttributeError:
-                if hasattr(a, "action_data"):
-                    a.action_data.x = int(x)
-                    a.action_data.y = int(y)
-            self.last_click = (int(x), int(y))
-            self.prev_action = a
-            self.prev_grid = grid
-            self.click_idx += 1
-            return a
+            # Use ACTION5/7 for positioning (every 3rd action)
+            if self.click_idx % 3 == 0:
+                for alt in (GameAction.ACTION5, GameAction.ACTION7):
+                    if alt in avail:
+                        a = alt
+                        a.reasoning = {"why": "v17-click-position", "click_idx": self.click_idx}
+                        self.prev_action = a
+                        self.prev_grid = grid
+                        return a
 
-        if self.click_idx % 3 == 0:
+            if has_action6:
+                a = GameAction.ACTION6
+                d = diff_cells(self.prev_grid, grid)
+                if len(d) > self.hot_delta and self.last_click is not None:
+                    self.hot_cell = self.last_click
+                    self.hot_delta = len(d)
+
+                # HOT-CELL PERSISTENCE: If we have a hot cell, strongly bias toward it
+                if self.hot_cell is not None and self.click_idx < len(self.click_cells):
+                    # 70% chance to click near hot cell, 30% to continue pattern
+                    if random.random() < 0.7:
+                        jx = max(0, min(63, self.hot_cell[0] + random.randint(-3, 3)))
+                        jy = max(0, min(63, self.hot_cell[1] + random.randint(-3, 3)))
+                        x, y = jx, jy
+                    elif self.click_idx < len(self.click_cells):
+                        x, y = self.click_cells[self.click_idx]
+                        self.click_idx += 1
+                    else:
+                        self.click_cells = [(random.randint(4, 60), random.randint(4, 60))
+                                            for _ in range(25)]
+                        self.click_idx = 1
+                        x, y = self.click_cells[0]
+                elif self.click_idx < len(self.click_cells):
+                    x, y = self.click_cells[self.click_idx]
+                    self.click_idx += 1
+                else:
+                    self.click_cells = [(random.randint(4, 60), random.randint(4, 60))
+                                        for _ in range(25)]
+                    self.click_idx = 1
+                    x, y = self.click_cells[0]
+
+                try:
+                    a.set_data({"x": int(x), "y": int(y)})
+                except AttributeError:
+                    if hasattr(a, "action_data"):
+                        a.action_data.x = int(x)
+                        a.action_data.y = int(y)
+                self.last_click = (int(x), int(y))
+                self.prev_action = a
+                self.path.append(a)
+                self.prev_grid = grid
+                self.click_idx += 1
+                return a
+
             for alt in (GameAction.ACTION5, GameAction.ACTION7):
                 if alt in avail:
                     a = alt
-                    a.reasoning = {"why": "v14-click-position", "click_idx": self.click_idx}
+                    a.reasoning = {"why": "v17-click-fallback-position"}
                     self.prev_action = a
                     self.prev_grid = grid
                     return a
 
-        if has_action6:
-            a = GameAction.ACTION6
-            d = diff_cells(self.prev_grid, grid)
-            if len(d) > self.hot_delta and self.last_click is not None:
-                self.hot_cell = self.last_click
-                self.hot_delta = len(d)
-
-            if self.hot_cell is not None and self.click_idx >= len(self.click_cells):
-                jx = max(0, min(63, self.hot_cell[0] + random.randint(-5, 5)))
-                jy = max(0, min(63, self.hot_cell[1] + random.randint(-5, 5)))
-                x, y = jx, jy
-            elif self.click_idx < len(self.click_cells):
-                x, y = self.click_cells[self.click_idx]
-                self.click_idx += 1
-            else:
-                self.click_cells = [(random.randint(4, 60), random.randint(4, 60))
-                                    for _ in range(25)]
-                self.click_idx = 1
-                x, y = self.click_cells[0]
-
-            try:
-                a.set_data({"x": int(x), "y": int(y)})
-            except AttributeError:
-                if hasattr(a, "action_data"):
-                    a.action_data.x = int(x)
-                    a.action_data.y = int(y)
-            self.last_click = (int(x), int(y))
-            self.prev_action = a
-            self.prev_grid = grid
-            self.click_idx += 1
-            return a
-
-        for alt in (GameAction.ACTION5, GameAction.ACTION7):
-            if alt in avail:
-                a = alt
-                a.reasoning = {"why": "v14-click-fallback-position"}
-                self.prev_action = a
-                self.prev_grid = grid
-                return a
-
-        return random.choice(avail) if avail else GameAction.ACTION1
+            return random.choice(avail) if avail else GameAction.ACTION1
 
     def _choose_asymmetric(self, grid, avail) -> GameAction:
         """Handle asymmetric movement games (ACTION1-7 with varying magnitudes)."""
@@ -799,7 +842,7 @@ class MyAgent(Agent):
                     for alt in (GameAction.ACTION5, GameAction.ACTION7):
                         if alt in movable:
                             a = alt
-                            a.reasoning = {"why": "v16-stagnation-click-position", "stagnation": self.stagnation}
+                            a.reasoning = {"why": "v17-stagnation-click-position", "stagnation": self.stagnation}
                             self.prev_action = a
                             self.path.append(a)
                             self.prev_grid = grid
@@ -820,15 +863,26 @@ class MyAgent(Agent):
                         self.path.append(a)
                         self.prev_grid = grid
                         self.stagnation = 0
-                        a.reasoning = {"why": "v16-stagnation-click-reset"}
+                        a.reasoning = {"why": "v17-stagnation-click-reset"}
                         return a
-            
                 # For asymmetric games, force use of highest magnitude action EXCLUSIVELY
                 if self.game_type == "asymmetric" and self.action_magnitude:
                     best_act_val = max(self.action_magnitude.items(), key=lambda kv: kv[1])[0]
                     for a in movable:
                         if a.value == best_act_val:
-                            a.reasoning = {"why": "v16-stagnation-exclusive-max-asymmetric", "stagnation": self.stagnation, "magnitude": self.action_magnitude[best_act_val]}
+                            a.reasoning = {"why": "v17-stagnation-exclusive-max-asymmetric", "stagnation": self.stagnation, "magnitude": self.action_magnitude[best_act_val]}
+                            self.prev_action = a
+                            self.path.append(a)
+                            self.prev_grid = grid
+                            self.stagnation = 0
+                            return a
+
+                # For maze games, try ACTION5/7 if they have high magnitude (repositioning)
+                if self.game_type == "maze" and self.action_magnitude:
+                    max_mag = max(self.action_magnitude.values())
+                    for a in movable:
+                        if a.value in self.action_magnitude and self.action_magnitude[a.value] >= max_mag * 0.8 and a.value in (5, 6, 7):
+                            a.reasoning = {"why": "v17-stagnation-maze-reposition", "stagnation": self.stagnation, "magnitude": self.action_magnitude[a.value]}
                             self.prev_action = a
                             self.path.append(a)
                             self.prev_grid = grid
@@ -839,7 +893,7 @@ class MyAgent(Agent):
                 if unused:
                     act = random.choice(unused)
                     a = act
-                    a.reasoning = {"why": "v15-stagnation-unused", "stagnation": self.stagnation}
+                    a.reasoning = {"why": "v17-stagnation-unused", "stagnation": self.stagnation}
                     self.prev_action = a
                     self.path.append(a)
                     self.prev_grid = grid
@@ -849,7 +903,7 @@ class MyAgent(Agent):
                     best_act = max(self.action_magnitude.items(), key=lambda kv: kv[1])[0]
                     for a in movable:
                         if a.value == best_act:
-                            a.reasoning = {"why": "v15-stagnation-max-mag", "stagnation": self.stagnation}
+                            a.reasoning = {"why": "v17-stagnation-max-mag", "stagnation": self.stagnation}
                             self.prev_action = a
                             self.path.append(a)
                             self.prev_grid = grid
@@ -858,7 +912,7 @@ class MyAgent(Agent):
                 if len(movable) > 1:
                     act = random.choice([a for a in movable if a != self.prev_action])
                     a = act
-                    a.reasoning = {"why": "v15-stagnation-random", "stagnation": self.stagnation}
+                    a.reasoning = {"why": "v17-stagnation-random", "stagnation": self.stagnation}
                     self.prev_action = a
                     self.path.append(a)
                     self.prev_grid = grid
@@ -969,6 +1023,18 @@ class MyAgent(Agent):
                         and len(self.path) >= 3):
                     self.best_depth = len(self.visited_life | self.world_visited)
                     self.best_path = list(self.path[:-1])
+            # Learn death cell from where we died
+            if self.pos is not None:
+                death_key = (int(self.pos[0]) // 6 * 6, int(self.pos[1]) // 6 * 6)
+                self.death_cells.add((death_key, self.prev_action))
+                # Also add the position we tried to move to
+                if self.prev_action is not None and self.prev_action.value in self.action_effects:
+                    dy, dx = self.action_effects[self.prev_action.value]
+                    if dy != 0 or dx != 0:
+                        dead_y = self.pos[0] + dy
+                        dead_x = self.pos[1] + dx
+                        dead_key = (int(dead_y) // 6 * 6, int(dead_x) // 6 * 6)
+                        self.death_cells.add((dead_key, self.prev_action))
             self.new_life()
             return GameAction.RESET
 
@@ -980,8 +1046,15 @@ class MyAgent(Agent):
                 self._learn_walls_from_diff(self.prev_grid, grid)
             except Exception:
                 pass
+        else:
+            # First step - just track position to initialize
+            try:
+                self._track(grid)
+            except Exception:
+                pass
 
         # --- classify game type ---
+                # --- classify game type ---
         self._classify_game(avail)
 
         # --- learn walls from static grid ---
@@ -989,7 +1062,7 @@ class MyAgent(Agent):
         # Also do a full grid scan once per life to learn all walls
         if len(self.wall_cells) < 100 and self.prev_grid is None:
             self._full_grid_wall_scan(grid)
-        
+       
         # --- detect goal for ls20 ---
         self._detect_goal(grid)
 
