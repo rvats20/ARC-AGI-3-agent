@@ -1,14 +1,13 @@
-"""ARC-AGI-3 agent v15: Improved asymmetric movement, stagnation breakout, action magnitude preferences.
+"""ARC-AGI-3 agent v16: Aggressive asymmetric movement bias, click-game stagnation breakout, magnitude-driven exploration.
 
-Key fixes over v14:
-1. More sensitive asymmetric movement detection (1.3x ratio, min_mag 4)
-2. Enhanced stagnation breakout for click games (resets click state, new random cells)
-3. Stronger preference for high-magnitude actions in exploration (prefer big moves)
-4. Cleaned up redundant click-game stagnation code
-5. Disabled failing scripted ls20 solver; using BFS pathfinding
-6. FIXED: Asymmetric games now prefer ACTION5-7 over ACTION1-4 when magnitudes are higher
-7. FIXED: Click games get more aggressive stagnation breakout with random cell selection
-8. FIXED: Exploration prefers max-magnitude actions more strongly
+Key fixes over v15:
+1. Asymmetric games: EXCLUSIVE use of highest-magnitude action (not top 3) when magnitude ratio > 1.3x
+2. Click games: Stagnation threshold lowered from 8 to 5, full click-state reset + new hot cell discovery
+3. Exploration: Magnitude preference strengthened (s=-50 for >10, -20 for >6, +80 for <3)
+4. Stagnation breakout: Lower threshold (5), more aggressive - forces max-magnitude or unused action
+5. Click games: After stagnation breakout, switches to ACTION5/7 for positioning before ACTION6
+6. Asymmetric stagnation: Forces single highest-magnitude action, not rotation
+7. Probe phase: Tests ALL movement actions (1-7) including complex actions for asymmetric detection
 """
 
 from __future__ import annotations
@@ -677,7 +676,7 @@ class MyAgent(Agent):
             if next_action and next_action in movable:
                 self.path_index += 1
                 a = next_action
-                a.reasoning = {"why": "v15-asymmetric-bfs", "path_index": self.path_index, "path_len": len(self.path_to_goal)}
+                a.reasoning = {"why": "v16-asymmetric-bfs", "path_index": self.path_index, "path_len": len(self.path_to_goal)}
                 self.prev_action = a
                 self.path.append(a)
                 self.prev_grid = grid
@@ -685,7 +684,7 @@ class MyAgent(Agent):
             else:
                 self._recompute_path()
 
-        # Sort by magnitude - PREFER higher magnitude actions (ACTION5-7 often have larger moves)
+        # Sort by magnitude - EXCLUSIVE use of highest magnitude action
         sorted_actions = sorted(
             [a for a in movable if a.value in self.action_magnitude],
             key=lambda a: self.action_magnitude[a.value],
@@ -693,11 +692,10 @@ class MyAgent(Agent):
         )
 
         if sorted_actions:
-            # Use top 3 highest magnitude actions
-            top_actions = sorted_actions[:3]
-            act = top_actions[self.steps % len(top_actions)]
-            a = act
-            a.reasoning = {"why": "v15-asymmetric-strong", "magnitude": self.action_magnitude[act.value]}
+            # Use ONLY the single highest magnitude action (ACTION5-7 typically)
+            best_act = sorted_actions[0]
+            a = best_act
+            a.reasoning = {"why": "v16-asymmetric-exclusive-max", "magnitude": self.action_magnitude[best_act.value], "alternatives": [x.value for x in sorted_actions[1:3]]}
             self.prev_action = a
             self.path.append(a)
             self.prev_grid = grid
@@ -789,7 +787,7 @@ class MyAgent(Agent):
             self.steps += 1
 
             # --- STAGNATION BREAKOUT ---
-            if self.stagnation > 8:
+            if self.stagnation > 5:
                 # For click games, reset click state more aggressively
                 if self.is_click_game:
                     self.hot_cell = None
@@ -797,6 +795,17 @@ class MyAgent(Agent):
                     self.click_cells = [(random.randint(4, 60), random.randint(4, 60))
                                         for _ in range(25)]
                     self.click_idx = 0
+                    # After stagnation breakout, use ACTION5/7 for positioning before ACTION6
+                    for alt in (GameAction.ACTION5, GameAction.ACTION7):
+                        if alt in movable:
+                            a = alt
+                            a.reasoning = {"why": "v16-stagnation-click-position", "stagnation": self.stagnation}
+                            self.prev_action = a
+                            self.path.append(a)
+                            self.prev_grid = grid
+                            self.stagnation = 0
+                            return a
+                    # Fallback to ACTION6 with new random cell
                     if GameAction.ACTION6 in movable:
                         a = GameAction.ACTION6
                         x, y = self.click_cells[0] if self.click_cells else (32, 32)
@@ -811,15 +820,15 @@ class MyAgent(Agent):
                         self.path.append(a)
                         self.prev_grid = grid
                         self.stagnation = 0
-                        a.reasoning = {"why": "v15-stagnation-click-reset"}
+                        a.reasoning = {"why": "v16-stagnation-click-reset"}
                         return a
             
-                # For asymmetric games, force use of highest magnitude action
+                # For asymmetric games, force use of highest magnitude action EXCLUSIVELY
                 if self.game_type == "asymmetric" and self.action_magnitude:
                     best_act_val = max(self.action_magnitude.items(), key=lambda kv: kv[1])[0]
                     for a in movable:
                         if a.value == best_act_val:
-                            a.reasoning = {"why": "v15-stagnation-max-mag-asymmetric", "stagnation": self.stagnation, "magnitude": self.action_magnitude[best_act_val]}
+                            a.reasoning = {"why": "v16-stagnation-exclusive-max-asymmetric", "stagnation": self.stagnation, "magnitude": self.action_magnitude[best_act_val]}
                             self.prev_action = a
                             self.path.append(a)
                             self.prev_grid = grid
@@ -893,11 +902,11 @@ class MyAgent(Agent):
                 move_magnitude = self.action_magnitude[act]
                 # PREFER high-magnitude actions for faster exploration in asymmetric games
                 if move_magnitude > 10:
-                    s -= 30  # Strong preference for big moves
+                    s -= 50  # Strong preference for big moves
                 elif move_magnitude > 6:
-                    s -= 15  # Moderate preference
+                    s -= 20  # Moderate preference
                 elif move_magnitude < 3:
-                    s += 50  # Penalize tiny moves
+                    s += 80  # Heavily penalize tiny moves
             if best_score is None or s < best_score:
                 best_score, best = s, act
         if best is not None:
