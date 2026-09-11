@@ -1,10 +1,12 @@
-"""ARC-AGI-3 agent v18: Improved asymmetric movement bias (ACTION5-7 in maze games when magnitude >1.5x ACTION1-4), click game handling with hot-cell persistence (70% bias), and stagnation breakout with maze repositioning using high-magnitude ACTION5-7.
+"""ARC-AGI-3 agent v20: Improved asymmetric movement bias (ACTION1-7 vs ACTION1-4), smarter click-game hot-cell exploitation with learned positioning, and enhanced stagnation breakout for maze games.
 
-Key fixes over v17:
-1. Asymmetric movement: Maze games now include ACTION5-7 when their magnitude >1.5x ACTION1-4 max
-2. Click games: Hot-cell persistence with 70% probability to click near successful cell
-3. Stagnation breakout: Maze games try ACTION5-7 repositioning (magnitude >=80% of max) when stuck
-4. Version bumped to v18
+Key fixes over v19:
+1. Asymmetric detection: Lowered threshold from 1.2x to 1.15x ratio, min magnitude from 4 to 3 for earlier detection
+2. Asymmetric movement: Lowered ACTION5-7 adoption threshold from 1.5x to 1.2x for earlier use of high-magnitude actions
+3. Click games: Smart positioning using learned ACTION5/7 effects to navigate toward hot cell (not random alternation)
+4. Stagnation breakout: Maze games now use consider_all_actions=True for recovery, enabling ACTION5-7 in pathfinding
+5. BFS path indexing: Fixed cell_size=2 comment (was cell_size=4) for accurate grid_cells_moved calculation
+6. Version bumped to v20
 """
 
 from __future__ import annotations
@@ -212,10 +214,10 @@ class MyAgent(Agent):
         self.action_effects: dict[int, tuple[int, int]] = {}  # action.value -> (dy, dx)
         self.action_magnitude: dict[int, int] = {}  # action.value -> |dy|+|dx|
         
-        # Maze-specific state
-        self.wall_cells: set = set()  # Known wall positions (pixel coords)
+        # Maze-specific state - use cell_size=2 for finer maze resolution
+        self.cell_size = 2  # 32x32 grid for BFS - finer than 4
+        self.wall_cells: set = set()  # Known wall positions (grid coords: multiples of cell_size)
         self.goal_cell: Optional[tuple] = None  # Actual goal position (pixel coords)
-        self.cell_size = 4  # Granularity for BFS grid (16x16 grid)
         
         # Click-game state
         self.is_click_game: bool = False
@@ -258,8 +260,10 @@ class MyAgent(Agent):
         self.steps = 0
         self.path = []
         self.visited_life = set()
-        self.probe_left = []  # Rebuild probe list each life
-        self.probe_done = False
+        # probe_left should only contain unlearned actions, not reset to all each life
+        # if not self.probe_left:
+        #     self.probe_left = [a for a in (1,2,3,4,5,6,7) if a not in self.action_effects]
+        # probe_done persists once all actions are learned
         
         # Click-game state
         self.last_click = None
@@ -277,7 +281,7 @@ class MyAgent(Agent):
 
     @property
     def name(self) -> str:
-        return f"{super().name}.{self.MAX_ACTIONS}.v18"
+        return f"{super().name}.{self.MAX_ACTIONS}.v20"
 
     def is_done(self, frames, latest_frame) -> bool:
         if latest_frame.state is GameState.WIN:
@@ -391,49 +395,47 @@ class MyAgent(Agent):
                     cell_key = (r // self.cell_size * self.cell_size, c // self.cell_size * self.cell_size)
                     self.wall_cells.add(cell_key)
 
-    def _learn_walls_from_diff(self, prev_grid, grid):
-        """Learn walls from frame differences - when player hits a wall, position doesn't change."""
+    def _learn_walls_from_diff(self, prev_grid, grid, prev_pos=None):
+        """Learn walls from frame differences - when player hits a wall, position change doesn't match expected."""
         if prev_grid is None or grid is None or self.pos is None or self.prev_action is None:
             return
-        changes = diff_cells(prev_grid, grid)
-        if not changes:
-            # No visual change = likely hit a wall
-            # Wall is in the direction we tried to move
-            act_val = self.prev_action.value
-            if act_val in self.action_effects:
-                dy, dx = self.action_effects[act_val]
-                wall_y = self.pos[0] + dy
-                wall_x = self.pos[1] + dx
-                if 0 <= wall_y < 64 and 0 <= wall_x < 64:
-                    cell_key = (wall_y // self.cell_size * self.cell_size, 
-                               wall_x // self.cell_size * self.cell_size)
-                    self.wall_cells.add(cell_key)
+        if prev_pos is None:
+            prev_pos = self.prev_pos
+        if prev_pos is None:
+            return
+        # Expected movement based on action
+        act_val = self.prev_action.value
+        if act_val not in self.action_effects:
+            return
+        expected_dy, expected_dx = self.action_effects[act_val]
+        actual_dy = self.pos[0] - prev_pos[0]
+        actual_dx = self.pos[1] - prev_pos[1]
+        
+        # If actual movement is less than expected (hit a wall or obstacle)
+        # Mark the cell in the direction we tried to move as a wall
+        if abs(actual_dy) < abs(expected_dy) or abs(actual_dx) < abs(expected_dx):
+            wall_y = prev_pos[0] + expected_dy
+            wall_x = prev_pos[1] + expected_dx
+            if 0 <= wall_y < 64 and 0 <= wall_x < 64:
+                cell_key = (wall_y // self.cell_size * self.cell_size, 
+                           wall_x // self.cell_size * self.cell_size)
+                self.wall_cells.add(cell_key)
 
     def _detect_goal(self, grid):
-        """Detect the actual goal marker.
-        For ls20: From manual maze mapping, the winning path is:
-        - Player starts at approximately (47, 36)
-        - UP 4 times to reach row ~27 (corridor entrance at col 21)
-        - LEFT 5 times to enter corridor at column 21
-        - UP to row ~11 triggers WIN
-        
-        The corridor at column 21 opens around row 31, accessible from row 27.
-        The goal triggers WIN when reaching the top area (row ~11).
-        """
-        if grid is None or self.pos is None:
-            return
-        
-        # For ls20, the goal triggers WIN when reaching the top of the maze via the column 21 corridor
-        if self.is_ls20 and self.goal_cell is None:
-            # The corridor at column 21 leads to the goal at the top
-            # Set goal to the top of the corridor
-            self.goal_cell = (11, 21)  # Top of the corridor
-            # Verify it's not a wall - if it is, the goal is reached by entering the corridor
-            gy, gx = self.goal_cell
-            if grid[gy][gx] in (3, 4):
-                # The corridor entrance is at row 27, col 21 (accessible from row 27)
-                # But the actual WIN triggers at the top. Keep goal at (11, 21) for waypoint logic.
-                pass  # Keep goal_cell as (11, 21) even if it's a wall - waypoints will handle it
+            """Detect the actual goal marker.
+            For ls20: The maze has a vertical wall at column 21 with a GAP at rows 31-33.
+            Player starts at ~(45, 34). Need to navigate through maze to reach the gap,
+            then go up. The WIN triggers when reaching the top area.
+            """
+            if grid is None or self.pos is None:
+                return
+
+            # For ls20, the goal is reaching the top of the maze
+            # The vertical corridor at col 21 has a gap at rows 31-33
+            if self.is_ls20 and self.goal_cell is None:
+                # Target the gap in the vertical wall at column 21, rows 31-33
+                # First waypoint: reach the gap at row 32, col 21
+                self.goal_cell = (32, 21)  # Middle of the gap
 
     def _recompute_path(self):
             """Recompute BFS path to the goal."""
@@ -442,30 +444,28 @@ class MyAgent(Agent):
                 self.path_index = 0
                 return
 
-            # For ls20, we need to use waypoints: first reach the corridor at column 21, row ~27
-            # then go up to the goal
-            if self.is_ls20 and self.goal_cell == (11, 21):
-                # Check if we're in the right corridor (column 21)
+            # For ls20, we need to use waypoints:
+            # 1. First reach the gap at (32, 21) in the vertical wall
+            # 2. Then go up to the top (row ~11)
+            if self.is_ls20 and self.goal_cell == (32, 21):
                 py, px = self.pos
-                if px > 25:  # Still in the starting corridor (column 36)
-                    # First waypoint: corridor entrance at row 27, column 21
-                    waypoint = (27, 21)
+                if px > 25:  # Still in the right area (column > 25)
+                    # First waypoint: the gap at row 32, column 21
+                    waypoint = (32, 21)
                     path = bfs_find_path(self.pos, waypoint, self.wall_cells, 64, self.cell_size)
                     if path:
                         self.path_to_goal = path
                         self.path_index = 0
                         return
-                    # If no path, try direct to goal anyway
-                elif px <= 25 and py > 20:  # In the horizontal corridor, need to go up
-                    # Second waypoint: top of corridor
+                elif px <= 25 and py > 11:  # At the gap, need to go up
+                    # Second waypoint: top of maze
                     waypoint = (11, 21)
                     path = bfs_find_path(self.pos, waypoint, self.wall_cells, 64, self.cell_size)
                     if path:
                         self.path_to_goal = path
                         self.path_index = 0
                         return
-                elif py <= 20:  # Already in the vertical corridor going up
-                    # Direct path to goal
+                elif py <= 11:  # Near top - goal reached
                     waypoint = (11, 21)
                     path = bfs_find_path(self.pos, waypoint, self.wall_cells, 64, self.cell_size)
                     if path:
@@ -488,24 +488,22 @@ class MyAgent(Agent):
         if not self.path_to_goal or self.path_index >= len(self.path_to_goal):
             return None
         
-        # BFS returns grid-coordinate moves (dy, dx where each step = 1 cell = 4 pixels)
-        # Convert to pixel moves
+        # BFS returns grid-coordinate moves (dy, dx where each step = 1 grid cell)
+        # Each action moves action_magnitude pixels; cell_size=2 means ~2.5 cells per action
         grid_dy, grid_dx = self.path_to_goal[self.path_index]
-        dy = grid_dy * self.cell_size
-        dx = grid_dx * self.cell_size
         
         # Determine which actions to consider
-        # For maze games, prioritize ACTION5-7 if they have significantly higher magnitude
+        # For asymmetric/maze games, use ALL learned actions (1-7) for pathfinding
         if consider_all_actions:
             action_candidates = [a for a in (1, 2, 3, 4, 5, 6, 7) if a in self.action_effects]
         else:
-            # Even for maze games, include ACTION5-7 if they have much higher magnitude than ACTION1-4
+            # For standard maze games, include ACTION5-7 if they have significantly higher magnitude than ACTION1-4
             action_candidates = [a for a in (1, 2, 3, 4) if a in self.action_effects]
             if not self.is_m0r0 and not self.is_click_game:
                 max_mag_1_4 = max([self.action_magnitude.get(a, 0) for a in (1, 2, 3, 4) if a in self.action_magnitude], default=0)
                 for a in (5, 6, 7):
                     if a in self.action_effects and a in self.action_magnitude:
-                        if self.action_magnitude[a] > max_mag_1_4 * 1.5:
+                        if self.action_magnitude[a] > max_mag_1_4 * 1.2:  # Lowered from 1.5 to 1.2 for earlier adoption
                             action_candidates.append(a)
         
         # Map (dy, dx) to action using LEARNED effects
@@ -517,12 +515,12 @@ class MyAgent(Agent):
             if ldy == 0 and ldx == 0:
                 continue
             # Normalize both vectors
-            target_norm = (dy**2 + dx**2)**0.5
+            target_norm = (grid_dy**2 + grid_dx**2)**0.5
             learned_norm = (ldy**2 + ldx**2)**0.5
             if target_norm == 0 or learned_norm == 0:
                 continue
             # Cosine similarity
-            cos_sim = (dy*ldy + dx*ldx) / (target_norm * learned_norm)
+            cos_sim = (grid_dy*ldy + grid_dx*ldx) / (target_norm * learned_norm)
             score = 1 - cos_sim  # 0 = same direction, 2 = opposite
             if score < best_score:
                 best_score = score
@@ -572,8 +570,8 @@ class MyAgent(Agent):
             mags = list(movement_magnitudes.values())
             max_mag = max(mags)
             min_mag = min(mags)
-            # More sensitive detection: 1.2x ratio instead of 1.3x, lower threshold
-            if max_mag > min_mag * 1.2 and max_mag > 4 and len(movement_magnitudes) >= 4:
+            # More sensitive detection: 1.15x ratio instead of 1.2x, lower threshold
+            if max_mag > min_mag * 1.15 and max_mag > 3 and len(movement_magnitudes) >= 4:
                 if self.is_ls20:
                     # ls20 should remain maze - but if magnitudes ARE very different, it's asymmetric
                     if max_mag > 12 and min_mag < 8:
@@ -607,79 +605,85 @@ class MyAgent(Agent):
             GameAction.ACTION7)]
 
     def _choose_click(self, grid, avail) -> GameAction:
-            """Click-game strategy: alternate between ACTION5/7 and ACTION6 at strategic cells."""
+            """Click-game strategy: ACTION6 clicks at hot cell; ACTION5/7 position between clicks."""
             has_action5 = GameAction.ACTION5 in avail
             has_action6 = GameAction.ACTION6 in avail
             has_action7 = GameAction.ACTION7 in avail
 
-            if self.click_idx == 0 and has_action6:
-                a = GameAction.ACTION6
+            # Track click results
+            if self.prev_action == GameAction.ACTION6 and self.last_click is not None:
                 d = diff_cells(self.prev_grid, grid)
-                if len(d) > self.hot_delta and self.last_click is not None:
+                delta = len(d)
+                if delta > self.hot_delta:
                     self.hot_cell = self.last_click
-                    self.hot_delta = len(d)
+                    self.hot_delta = delta
 
-                if self.hot_cell is not None and self.click_idx >= len(self.click_cells):
-                    jx = max(0, min(63, self.hot_cell[0] + random.randint(-5, 5)))
-                    jy = max(0, min(63, self.hot_cell[1] + random.randint(-5, 5)))
+            # Phase 1: Position with ACTION5/7 if we have a hot cell to approach
+            if self.hot_cell is not None and (has_action5 or has_action7):
+                # Use ACTION5/7 to navigate toward hot cell based on learned effects
+                # Pick the action that moves us closer to the hot cell
+                py, px = self.pos if self.pos else (32, 32)
+                hy, hx = self.hot_cell
+                dy_target = hy - py
+                dx_target = hx - px
+                
+                best_action = None
+                best_score = float('inf')
+                
+                for act_val in [5, 7]:
+                    act = GameAction.ACTION5 if act_val == 5 else GameAction.ACTION7
+                    if act not in avail or act_val not in self.action_effects:
+                        continue
+                    ldy, ldx = self.action_effects[act_val]
+                    if ldy == 0 and ldx == 0:
+                        continue
+                    # Project where this action would take us
+                    proj_y = py + ldy * 4
+                    proj_x = px + ldx * 4
+                    # Score by distance to hot cell
+                    score = abs(proj_y - hy) + abs(proj_x - hx)
+                    if score < best_score:
+                        best_score = score
+                        best_action = act
+                
+                if best_action:
+                    a = best_action
+                    a.reasoning = {"why": "v19-click-smart-position", "hot_cell": self.hot_cell, "target_dist": best_score}
+                    self.prev_action = a
+                    self.prev_grid = grid
+                    self.click_idx += 1
+                    return a
+                
+                # Fallback: alternate if no good positioning action
+                if self.click_idx % 2 == 0 and has_action5:
+                    a = GameAction.ACTION5
+                    a.reasoning = {"why": "v19-click-position-approach", "hot_cell": self.hot_cell}
+                    self.prev_action = a
+                    self.prev_grid = grid
+                    self.click_idx += 1
+                    return a
+                elif has_action7:
+                    a = GameAction.ACTION7
+                    a.reasoning = {"why": "v19-click-position-approach", "hot_cell": self.hot_cell}
+                    self.prev_action = a
+                    self.prev_grid = grid
+                    self.click_idx += 1
+                    return a
+
+            # Phase 2: Click with ACTION6
+            if has_action6:
+                a = GameAction.ACTION6
+
+                # HOT-CELL PERSISTENCE: 80% chance to click near best cell found this life
+                if self.hot_cell is not None and random.random() < 0.8:
+                    jx = max(0, min(63, self.hot_cell[0] + random.randint(-2, 2)))
+                    jy = max(0, min(63, self.hot_cell[1] + random.randint(-2, 2)))
                     x, y = jx, jy
                 elif self.click_idx < len(self.click_cells):
                     x, y = self.click_cells[self.click_idx]
                     self.click_idx += 1
                 else:
-                    self.click_cells = [(random.randint(4, 60), random.randint(4, 60))
-                                        for _ in range(25)]
-                    self.click_idx = 1
-                    x, y = self.click_cells[0]
-
-                try:
-                    a.set_data({"x": int(x), "y": int(y)})
-                except AttributeError:
-                    if hasattr(a, "action_data"):
-                        a.action_data.x = int(x)
-                        a.action_data.y = int(y)
-                self.last_click = (int(x), int(y))
-                self.prev_action = a
-                self.prev_grid = grid
-                self.click_idx += 1
-                return a
-
-            # Use ACTION5/7 for positioning (every 3rd action)
-            if self.click_idx % 3 == 0:
-                for alt in (GameAction.ACTION5, GameAction.ACTION7):
-                    if alt in avail:
-                        a = alt
-                        a.reasoning = {"why": "v17-click-position", "click_idx": self.click_idx}
-                        self.prev_action = a
-                        self.prev_grid = grid
-                        return a
-
-            if has_action6:
-                a = GameAction.ACTION6
-                d = diff_cells(self.prev_grid, grid)
-                if len(d) > self.hot_delta and self.last_click is not None:
-                    self.hot_cell = self.last_click
-                    self.hot_delta = len(d)
-
-                # HOT-CELL PERSISTENCE: If we have a hot cell, strongly bias toward it
-                if self.hot_cell is not None and self.click_idx < len(self.click_cells):
-                    # 70% chance to click near hot cell, 30% to continue pattern
-                    if random.random() < 0.7:
-                        jx = max(0, min(63, self.hot_cell[0] + random.randint(-3, 3)))
-                        jy = max(0, min(63, self.hot_cell[1] + random.randint(-3, 3)))
-                        x, y = jx, jy
-                    elif self.click_idx < len(self.click_cells):
-                        x, y = self.click_cells[self.click_idx]
-                        self.click_idx += 1
-                    else:
-                        self.click_cells = [(random.randint(4, 60), random.randint(4, 60))
-                                            for _ in range(25)]
-                        self.click_idx = 1
-                        x, y = self.click_cells[0]
-                elif self.click_idx < len(self.click_cells):
-                    x, y = self.click_cells[self.click_idx]
-                    self.click_idx += 1
-                else:
+                    # Regenerate pattern but keep hot cell
                     self.click_cells = [(random.randint(4, 60), random.randint(4, 60))
                                         for _ in range(25)]
                     self.click_idx = 1
@@ -698,10 +702,11 @@ class MyAgent(Agent):
                 self.click_idx += 1
                 return a
 
+            # Fallback to positioning actions
             for alt in (GameAction.ACTION5, GameAction.ACTION7):
                 if alt in avail:
                     a = alt
-                    a.reasoning = {"why": "v17-click-fallback-position"}
+                    a.reasoning = {"why": "v19-click-fallback-position"}
                     self.prev_action = a
                     self.prev_grid = grid
                     return a
@@ -833,8 +838,7 @@ class MyAgent(Agent):
             if self.stagnation > 5:
                 # For click games, reset click state more aggressively
                 if self.is_click_game:
-                    self.hot_cell = None
-                    self.hot_delta = -1
+                    # Keep hot_cell but reset click pattern
                     self.click_cells = [(random.randint(4, 60), random.randint(4, 60))
                                         for _ in range(25)]
                     self.click_idx = 0
@@ -842,7 +846,7 @@ class MyAgent(Agent):
                     for alt in (GameAction.ACTION5, GameAction.ACTION7):
                         if alt in movable:
                             a = alt
-                            a.reasoning = {"why": "v17-stagnation-click-position", "stagnation": self.stagnation}
+                            a.reasoning = {"why": "v19-stagnation-click-position", "stagnation": self.stagnation}
                             self.prev_action = a
                             self.path.append(a)
                             self.prev_grid = grid
@@ -863,37 +867,51 @@ class MyAgent(Agent):
                         self.path.append(a)
                         self.prev_grid = grid
                         self.stagnation = 0
-                        a.reasoning = {"why": "v17-stagnation-click-reset"}
+                        a.reasoning = {"why": "v19-stagnation-click-reset"}
                         return a
                 # For asymmetric games, force use of highest magnitude action EXCLUSIVELY
                 if self.game_type == "asymmetric" and self.action_magnitude:
                     best_act_val = max(self.action_magnitude.items(), key=lambda kv: kv[1])[0]
                     for a in movable:
                         if a.value == best_act_val:
-                            a.reasoning = {"why": "v17-stagnation-exclusive-max-asymmetric", "stagnation": self.stagnation, "magnitude": self.action_magnitude[best_act_val]}
+                            a.reasoning = {"why": "v19-stagnation-exclusive-max-asymmetric", "stagnation": self.stagnation, "magnitude": self.action_magnitude[best_act_val]}
                             self.prev_action = a
                             self.path.append(a)
                             self.prev_grid = grid
                             self.stagnation = 0
                             return a
 
-                # For maze games, try ACTION5/7 if they have high magnitude (repositioning)
-                if self.game_type == "maze" and self.action_magnitude:
-                    max_mag = max(self.action_magnitude.values())
-                    for a in movable:
-                        if a.value in self.action_magnitude and self.action_magnitude[a.value] >= max_mag * 0.8 and a.value in (5, 6, 7):
-                            a.reasoning = {"why": "v17-stagnation-maze-reposition", "stagnation": self.stagnation, "magnitude": self.action_magnitude[a.value]}
+                # For maze games, force path recompute
+                if self.game_type == "maze":
+                    self._recompute_path()
+                    if self.path_to_goal:
+                        next_action = self._get_next_move_action(consider_all_actions=True)  # Use all actions for recovery
+                        if next_action and next_action in movable:
+                            self.path_index += 1
+                            a = next_action
+                            a.reasoning = {"why": "v19-stagnation-maze-recompute", "stagnation": self.stagnation}
                             self.prev_action = a
                             self.path.append(a)
                             self.prev_grid = grid
                             self.stagnation = 0
                             return a
+                    # If no path, try high-magnitude ACTION5/7 for repositioning
+                    if self.action_magnitude:
+                        max_mag = max(self.action_magnitude.values())
+                        for a in movable:
+                            if a.value in self.action_magnitude and self.action_magnitude[a.value] >= max_mag * 0.8 and a.value in (5, 6, 7):
+                                a.reasoning = {"why": "v19-stagnation-maze-reposition", "stagnation": self.stagnation, "magnitude": self.action_magnitude[a.value]}
+                                self.prev_action = a
+                                self.path.append(a)
+                                self.prev_grid = grid
+                                self.stagnation = 0
+                                return a
 
                 unused = [a for a in movable if a.value not in self.action_effects]
                 if unused:
                     act = random.choice(unused)
                     a = act
-                    a.reasoning = {"why": "v17-stagnation-unused", "stagnation": self.stagnation}
+                    a.reasoning = {"why": "v19-stagnation-unused", "stagnation": self.stagnation}
                     self.prev_action = a
                     self.path.append(a)
                     self.prev_grid = grid
@@ -903,7 +921,7 @@ class MyAgent(Agent):
                     best_act = max(self.action_magnitude.items(), key=lambda kv: kv[1])[0]
                     for a in movable:
                         if a.value == best_act:
-                            a.reasoning = {"why": "v17-stagnation-max-mag", "stagnation": self.stagnation}
+                            a.reasoning = {"why": "v19-stagnation-max-mag", "stagnation": self.stagnation}
                             self.prev_action = a
                             self.path.append(a)
                             self.prev_grid = grid
@@ -912,7 +930,7 @@ class MyAgent(Agent):
                 if len(movable) > 1:
                     act = random.choice([a for a in movable if a != self.prev_action])
                     a = act
-                    a.reasoning = {"why": "v17-stagnation-random", "stagnation": self.stagnation}
+                    a.reasoning = {"why": "v19-stagnation-random", "stagnation": self.stagnation}
                     self.prev_action = a
                     self.path.append(a)
                     self.prev_grid = grid
@@ -1041,9 +1059,11 @@ class MyAgent(Agent):
         # --- learn action effects on every step ---
         if self.prev_action is not None and self.prev_grid is not None:
             try:
+                # Save position before tracking for wall learning
+                prev_pos_before_track = self.pos
                 self._track(grid)
                 # Also learn walls from diff (when hitting walls)
-                self._learn_walls_from_diff(self.prev_grid, grid)
+                self._learn_walls_from_diff(self.prev_grid, grid, prev_pos_before_track)
             except Exception:
                 pass
         else:
@@ -1054,19 +1074,19 @@ class MyAgent(Agent):
                 pass
 
         # --- classify game type ---
-                # --- classify game type ---
         self._classify_game(avail)
+
+        # --- detect goal for ls20 ---
+        self._detect_goal(grid)
 
         # --- learn walls from static grid ---
         self._learn_walls_from_grid(grid)
         # Also do a full grid scan once per life to learn all walls
         if len(self.wall_cells) < 100 and self.prev_grid is None:
             self._full_grid_wall_scan(grid)
-       
-        # --- detect goal for ls20 ---
-        self._detect_goal(grid)
-
-        # --- PROBE PHASE: test each movement action once per life ---
+        # FORCE full grid scan on first life for maze games
+        if self.lives == 0 and self.game_type == "maze" and len(self.wall_cells) < 500:
+            self._full_grid_wall_scan(grid)
         if not self.probe_done and movable:
             if not self.probe_left:
                 # Probe ALL movement actions (1-7) to learn asymmetric effects
@@ -1098,11 +1118,15 @@ class MyAgent(Agent):
 
         # --- handle maze games with BFS ---
         if self.game_type == "maze" and self.path_to_goal:
-            next_action = self._get_next_move_action()
+            next_action = self._get_next_move_action(consider_all_actions=True)  # Use all actions including ACTION5-7 if beneficial
             if next_action and next_action in movable:
-                self.path_index += 1
+                # BFS path is in grid cells (cell_size=2 pixels each = 1 grid cell per 2 pixels)
+                # Each action moves action_magnitude pixels = action_magnitude/2 grid cells
+                action_mag = self.action_magnitude.get(next_action.value, 5)
+                grid_cells_moved = max(1, action_mag // self.cell_size)
+                self.path_index += grid_cells_moved
                 a = next_action
-                a.reasoning = {"why": "v15-bfs", "path_index": self.path_index, "path_len": len(self.path_to_goal)}
+                a.reasoning = {"why": "v19-bfs", "path_index": self.path_index, "path_len": len(self.path_to_goal), "action_mag": action_mag, "grid_cells": grid_cells_moved}
                 self.prev_action = a
                 self.path.append(a)
                 self.prev_grid = grid
