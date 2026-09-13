@@ -73,9 +73,14 @@ def build() -> dict:
     # as a notebook output. Otherwise the "Submit to Competition" UI would
     # offer it as a candidate submission file alongside submission.parquet,
     # and an unlucky default selection rejects the submission.
+    qwen_src = ROOT / "agent" / "qwen_agent.py"
+    qwen_body = qwen_src.read_text() if qwen_src.exists() else ""
     write_agent_cell = code_cell(
         "%%writefile /tmp/my_agent.py\n" + agent_body
     )
+    write_qwen_cell = code_cell(
+        "%%writefile /tmp/qwen_agent.py\n" + qwen_body
+    ) if qwen_body else None
 
     run_cell_source = dedent(
         """\
@@ -265,7 +270,10 @@ def build() -> dict:
         },
         "nbformat_minor": 4,
         "nbformat": 4,
-        "cells": [
+        "cells": [],
+    }
+    # Build cells in correct order: install -> write agents -> serve -> run -> dummy
+    cells = [
             markdown_cell(
                 "# ARC Prize 2026 — ARC-AGI-3 Submission\n\n"
                 "Built from `agent/my_agent.py` via `scripts/build_notebook.py`. "
@@ -274,11 +282,11 @@ def build() -> dict:
             ),
             install_cell,
             write_agent_cell,
-            run_cell,
-            serve_cell,
-            dummy_submission_cell,
-        ],
-    }
+        ]
+    if write_qwen_cell:
+        cells.append(write_qwen_cell)
+    cells.extend([serve_cell, run_cell, dummy_submission_cell])
+    notebook["cells"] = cells
     return notebook
 
 
