@@ -174,24 +174,55 @@ def build() -> dict:
 
         def _find_wheelhouse():
             import os as _os
+            # Check multiple patterns: wheels/ dir, *.whl files, wls/ etc
             for top in glob.glob('/kaggle/input/*'):
-                for root, dirs, _ in _os.walk(top):
+                for root, dirs, files in _os.walk(top):
                     if 'wheels' in dirs:
+                        return root + '/wheels'
+                    if any(f.endswith('.whl') for f in files):
                         return root
+                    if any(f.endswith('.whl') for f in dirs):
+                        return root
+            # Also check known competition wheels
+            for p in glob.glob('/kaggle/input/*/wheels'):
+                return p
+            for p in glob.glob('/kaggle/input/*/*.whl'):
+                return os.path.dirname(p)
             return None
 
         if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
             print('Mounted /kaggle/input entries:',
                   sorted(glob.glob('/kaggle/input/*')))
+            for top in sorted(glob.glob('/kaggle/input/*')):
+                print(' ', top, ':', os.listdir(top)[:10] if os.path.isdir(top) else 'not dir')
             model_dir = _find_model_dir()
             wh = _find_wheelhouse()
             if not model_dir:
                 print('No model dataset mounted under /kaggle/input -> '
                       'QwenAgent will use the heuristic fallback.')
+                print('All input walk:', [r for r,_,fs in os.walk('/kaggle/input') if 'config.json' in fs][:5])
             else:
                 print('Model dir:', model_dir, '| wheelhouse:', wh)
                 if wh:
-                    !pip install --no-index --find-links {wh}/wheels vllm 2>&1 | tail -3
+                    import os as _os2
+                    wh_files = os.listdir(wh)[:15] if _os2.path.isdir(wh) else []
+                    print('Wheelhouse contents:', wh_files)
+                    # Try multiple pip install locations
+                    for wh_path in [wh, wh + '/wheels' if not wh.endswith('wheels') else wh, wh + '/..']:
+                        wh_path = os.path.normpath(wh_path)
+                        if _os2.path.isdir(wh_path):
+                            ret = !pip install --no-index --find-links {wh_path} vllm 2>&1 | tail -5
+                            print(f'pip from {wh_path}:', ret)
+                            break
+                    # Verify vllm importable
+                    try:
+                        import vllm
+                        print('vLLM version:', vllm.__version__)
+                    except Exception as e:
+                        print('vLLM import failed:', e)
+                else:
+                    print('No wheelhouse found - attempting pip install vllm anyway (may fail offline)')
+                    !pip install --no-index vllm 2>&1 | tail -3
                 # vLLM registers the model under the --model path; export it so
                 # the agent (run in the next cell, same kernel) requests the
                 # exact same model id.

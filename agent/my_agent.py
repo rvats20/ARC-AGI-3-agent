@@ -1,4 +1,4 @@
-"""ARC-AGI-3 agent v22: Further improvements - ls20 precomputed solution with magnitude-aware stepping, click-game hot-cell locking with ACTION5/7 positioning, asymmetric early-detection fix, probe-phase action selection, stagnation breakout v21.
+"""ARC-AGI-3 agent v25: disable broken ls20 precomputed (Sokoban not maze), robust wheelhouse detection, keep m0r0 solver.
 
 Key fixes over v21:
 1. ls20: Precomputed solution now accounts for learned action magnitude (not fixed 5 steps) - uses actual action_effects for step calculation
@@ -1151,30 +1151,10 @@ class MyAgent(Agent):
             self._m0r0_idx += 1
             return act
 
-        # --- ls20: use precomputed solution sequence with magnitude awareness ---
-        if self.is_ls20:
-            # Track life changes to reset sequence
-            if getattr(self, '_ls20_life', 0) != self.lives:
-                self._ls20_life = self.lives
-                self._ls20_step = 0
-            
-            # Build magnitude-aware solution if we have learned effects
-            if not hasattr(self, '_ls20_magnitude_solution') or self._ls20_life != getattr(self, '_ls20_magnitude_life', -1):
-                self._ls20_magnitude_solution = _build_ls20_solution_with_magnitudes(self.action_effects, self.action_magnitude)
-                self._ls20_magnitude_life = self._ls20_life
-            
-            # Use precomputed solution sequence (magnitude-aware if available)
-            solution = self._ls20_magnitude_solution if self._ls20_magnitude_solution else LS20_SOLUTION
-            if self._ls20_step < len(solution):
-                act = solution[self._ls20_step]
-                self._ls20_step += 1
-                a = act
-                a.reasoning = {"why": "ls20-precomputed-magnitude", "step": self._ls20_step, "total": len(solution)}
-                self.prev_action = a
-                self.path.append(a)
-                self.prev_grid = grid
-                return a
-            # Fall through to normal BFS logic if sequence exhausted
+        # --- ls20: DISABLED precomputed (was Sokoban misidentified as maze; now use BFS/explorer) ---
+        # Precomputed LS20_SOLUTION assumed simple wall maze but ls20 is Sokoban push game.
+        # Burning 26 steps on wrong path guarantees 0 levels. Let generic maze logic handle it.
+        pass  # ls20 falls through to death-learn + BFS/explorer below
 
         # --- detect death (frame collapsed to flat color) ---
         if (self.prev_grid is not None and not self._dead(self.prev_grid)
