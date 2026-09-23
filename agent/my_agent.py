@@ -1,11 +1,4 @@
-"""ARC-AGI-3 agent v29: Asymmetric bias refined, click games hot-cell locking at 2+, stagnation at 7 steps.
-
-Key improvements over v28:
-1. Asymmetric bias: ACTION5-7 probed first, exclusive max-mag in asymmetric mode, 1.02x threshold for maze pathfinding
-2. Click games: Hot cell locked after 2+ confirmed hits; spiral from center from life 0; ACTION5/7 positioning every 3 clicks
-3. Stagnation breakout: Click games trigger at 7 steps (stagnation > 6); asymmetric cycles top 2 actions; maze full wall rescan + ACTION5/7 reposition
-4. Unknown games with ACTION5-7: Force asymmetric classification when any high-mag ACTION5-7 present
-"""
+"""ARC-AGI-3 agent v30: Click game coordinate fix (hot_cell stored as y,x), asymmetric bias refined (min_mag_1_4 check + mag>8 catch), stagnation at 7 steps."""
 
 from __future__ import annotations
 
@@ -271,11 +264,12 @@ class MyAgent(Agent):
         # Click-game state
         self.is_click_game: bool = False
         self.last_click: Optional[tuple] = None
-        self.hot_cell: Optional[tuple] = None
+        self.hot_cell: Optional[tuple] = None  # Stored as (y, x) = (row, col)
         self.hot_delta: int = -1
         self.click_idx: int = 0
         self.click_cells: list = []
         # Track click results per cell for better hot cell detection
+        # Keys are (y, x) = (row, col)
         self.click_results: dict[tuple, int] = {}
         # Spiral pattern from center for click games - generated once, reused across lives
         self._generate_spiral_click_cells()
@@ -331,24 +325,25 @@ class MyAgent(Agent):
         self.prev_pos = None
 
     def _generate_spiral_click_cells(self):
-        """Generate spiral click pattern from center for better coverage."""
+        """Generate spiral click pattern from center for better coverage.
+        Cells stored as (y, x) = (row, col) to match grid indexing."""
         self.click_cells = []
-        cx, cy = 32, 32
+        cy, cx = 32, 32  # center row, center col
         # Spiral pattern from center for better coverage
         for radius in range(4, 32, 4):
             for angle in range(0, 360, 30):
                 import math
-                x = int(cx + radius * math.cos(math.radians(angle)))
-                y = int(cy + radius * math.sin(math.radians(angle)))
-                if 4 <= x <= 60 and 4 <= y <= 60:
-                    self.click_cells.append((x, y))
+                y = int(cy + radius * math.sin(math.radians(angle)))  # row = y
+                x = int(cx + radius * math.cos(math.radians(angle)))  # col = x
+                if 4 <= y <= 60 and 4 <= x <= 60:
+                    self.click_cells.append((y, x))  # Store as (row, col) = (y, x)
         # Add some random cells too
         self.click_cells.extend([(random.randint(4, 60), random.randint(4, 60)) for _ in range(10)])
         random.shuffle(self.click_cells)
 
     @property
     def name(self) -> str:
-        return f"{super().name}.{self.MAX_ACTIONS}.v29"
+        return f"{super().name}.{self.MAX_ACTIONS}.v30"
 
     def is_done(self, frames, latest_frame) -> bool:
         if latest_frame.state is GameState.WIN:
@@ -592,9 +587,16 @@ class MyAgent(Agent):
             action_candidates = [a for a in (1, 2, 3, 4) if a in self.action_effects]
             if not self.is_m0r0 and not self.is_click_game:
                 max_mag_1_4 = max([self.action_magnitude.get(a, 0) for a in (1, 2, 3, 4) if a in self.action_magnitude], default=0)
+                # Also consider min magnitude of 1-4 for better sensitivity
+                min_mag_1_4 = min([self.action_magnitude.get(a, 0) for a in (1, 2, 3, 4) if a in self.action_magnitude], default=0)
                 for a in (5, 6, 7):
                     if a in self.action_effects and a in self.action_magnitude:
-                        if self.action_magnitude[a] > max_mag_1_4 * 1.02:  # Lowered from 1.05 to 1.02 for earlier adoption
+                        mag = self.action_magnitude[a]
+                        # Include if >1.02x max of 1-4 OR >1.5x min of 1-4 (catches cases where some 1-4 are slow)
+                        if mag > max_mag_1_4 * 1.02 or (min_mag_1_4 > 0 and mag > min_mag_1_4 * 1.5):
+                            action_candidates.append(a)
+                        # Also include any ACTION5-7 with mag > 8 (clearly high-movement actions)
+                        elif mag > 8:
                             action_candidates.append(a)
         
         # Map (dy, dx) to action using LEARNED effects
@@ -827,28 +829,30 @@ class MyAgent(Agent):
 
                 # HOT-CELL PERSISTENCE: 95% chance to click near best cell found (across lives) after 2+ confirmations
                 if self.hot_cell is not None and self.hot_delta >= 2 and random.random() < 0.95:
-                    jx = max(0, min(63, self.hot_cell[0] + random.randint(-2, 2)))
-                    jy = max(0, min(63, self.hot_cell[1] + random.randint(-2, 2)))
-                    x, y = jx, jy
+                    # hot_cell is (y, x) = (row, col), set_data expects x=col, y=row
+                    hy, hx = self.hot_cell
+                    jy = max(0, min(63, hy + random.randint(-2, 2)))  # row jitter
+                    jx = max(0, min(63, hx + random.randint(-2, 2)))  # col jitter
+                    y, x = jy, jx
                 elif self.click_idx < len(self.click_cells):
-                    x, y = self.click_cells[self.click_idx]
+                    y, x = self.click_cells[self.click_idx]
                 else:
                     # Regenerate pattern but keep hot cell - use better coverage
                     self.click_cells = []
                     # Spiral pattern from center for better coverage
-                    cx, cy = 32, 32
+                    cy, cx = 32, 32
                     for radius in range(4, 32, 4):
                         for angle in range(0, 360, 30):
                             import math
-                            x = int(cx + radius * math.cos(math.radians(angle)))
-                            y = int(cy + radius * math.sin(math.radians(angle)))
-                            if 4 <= x <= 60 and 4 <= y <= 60:
-                                self.click_cells.append((x, y))
+                            y = int(cy + radius * math.sin(math.radians(angle)))  # row = y
+                            x = int(cx + radius * math.cos(math.radians(angle)))  # col = x
+                            if 4 <= y <= 60 and 4 <= x <= 60:
+                                self.click_cells.append((y, x))  # Store as (row, col) = (y, x)
                     # Add some random cells too
                     self.click_cells.extend([(random.randint(4, 60), random.randint(4, 60)) for _ in range(10)])
                     random.shuffle(self.click_cells)
                     self.click_idx = 0
-                    x, y = self.click_cells[0] if self.click_cells else (32, 32)
+                    y, x = self.click_cells[0] if self.click_cells else (32, 32)
 
                 try:
                     a.set_data({"x": int(x), "y": int(y)})
@@ -856,7 +860,7 @@ class MyAgent(Agent):
                     if hasattr(a, "action_data"):
                         a.action_data.x = int(x)
                         a.action_data.y = int(y)
-                self.last_click = (int(x), int(y))
+                self.last_click = (int(y), int(x))  # Store as (y, x) = (row, col)
                 self.prev_action = a
                 self.path.append(a)
                 self.prev_grid = grid
@@ -1002,14 +1006,14 @@ class MyAgent(Agent):
                     # Keep hot_cell but reset click pattern
                     self.click_cells = []
                     # Spiral pattern from center for better coverage
-                    cx, cy = 32, 32
+                    cy, cx = 32, 32
                     for radius in range(4, 32, 4):
                         for angle in range(0, 360, 30):
                             import math
-                            x = int(cx + radius * math.cos(math.radians(angle)))
-                            y = int(cy + radius * math.sin(math.radians(angle)))
-                            if 4 <= x <= 60 and 4 <= y <= 60:
-                                self.click_cells.append((x, y))
+                            y = int(cy + radius * math.sin(math.radians(angle)))  # row = y
+                            x = int(cx + radius * math.cos(math.radians(angle)))  # col = x
+                            if 4 <= y <= 60 and 4 <= x <= 60:
+                                self.click_cells.append((y, x))  # Store as (row, col) = (y, x)
                     # Add some random cells too
                     self.click_cells.extend([(random.randint(4, 60), random.randint(4, 60)) for _ in range(10)])
                     random.shuffle(self.click_cells)
@@ -1028,14 +1032,14 @@ class MyAgent(Agent):
                     # Fallback to ACTION6 with new random cell
                     if GameAction.ACTION6 in movable:
                         a = GameAction.ACTION6
-                        x, y = self.click_cells[0] if self.click_cells else (32, 32)
+                        y, x = self.click_cells[0] if self.click_cells else (32, 32)
                         try:
                             a.set_data({"x": int(x), "y": int(y)})
                         except AttributeError:
                             if hasattr(a, "action_data"):
                                 a.action_data.x = int(x)
                                 a.action_data.y = int(y)
-                        self.last_click = (int(x), int(y))
+                        self.last_click = (int(y), int(x))  # Store as (y, x) = (row, col)
                         self.prev_action = a
                         self.path.append(a)
                         self.prev_grid = grid
