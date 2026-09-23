@@ -1,10 +1,10 @@
-"""ARC-AGI-3 agent v28: Improved asymmetric bias, click games spiral from start, aggressive stagnation breakout.
+"""ARC-AGI-3 agent v29: Asymmetric bias refined, click games hot-cell locking at 2+, stagnation at 7 steps.
 
-Key improvements over v27:
-1. Asymmetric bias: Threshold lowered to 1.02x for ACTION5-7 inclusion in pathfinding; exclusive high-mag for asymmetric; probe ACTION5-7 first always
-2. Click games: Spiral pattern from center from life 0; hot cell locked after 2+ confirmations; ACTION5/7 positioning every 3 clicks
-3. Stagnation breakout: Click games at 7 steps (was 8); asymmetric forces exclusive max-mag + direction cycling; maze does full wall rescan + ACTION5/7 reposition
-4. Unknown games with ACTION5-7: Force asymmetric classification earlier; probe all 7 actions in magnitude order
+Key improvements over v28:
+1. Asymmetric bias: ACTION5-7 probed first, exclusive max-mag in asymmetric mode, 1.02x threshold for maze pathfinding
+2. Click games: Hot cell locked after 2+ confirmed hits; spiral from center from life 0; ACTION5/7 positioning every 3 clicks
+3. Stagnation breakout: Click games trigger at 7 steps (stagnation > 6); asymmetric cycles top 2 actions; maze full wall rescan + ACTION5/7 reposition
+4. Unknown games with ACTION5-7: Force asymmetric classification when any high-mag ACTION5-7 present
 """
 
 from __future__ import annotations
@@ -348,7 +348,7 @@ class MyAgent(Agent):
 
     @property
     def name(self) -> str:
-        return f"{super().name}.{self.MAX_ACTIONS}.v28"
+        return f"{super().name}.{self.MAX_ACTIONS}.v29"
 
     def is_done(self, frames, latest_frame) -> bool:
         if latest_frame.state is GameState.WIN:
@@ -745,7 +745,7 @@ class MyAgent(Agent):
                     self.click_results[self.last_click] = self.click_results.get(self.last_click, 0) + delta
                     # Update hot_cell based on best known cell (not just this life)
                     best_cell = max(self.click_results.items(), key=lambda kv: kv[1])[0] if self.click_results else None
-                    if best_cell and self.click_results[best_cell] > self.hot_delta:
+                    if best_cell and self.click_results[best_cell] >= 2 and self.click_results[best_cell] > self.hot_delta:
                         self.hot_cell = best_cell
                         self.hot_delta = self.click_results[best_cell]
 
@@ -782,7 +782,7 @@ class MyAgent(Agent):
                     
                     if best_action:
                         a = best_action
-                        a.reasoning = {"why": "v27-click-smart-position", "hot_cell": self.hot_cell, "target_dist": best_score}
+                        a.reasoning = {"why": "v29-click-smart-position", "hot_cell": self.hot_cell, "target_dist": best_score}
                         self.prev_action = a
                         self.prev_grid = grid
                         self.click_idx += 1
@@ -791,14 +791,14 @@ class MyAgent(Agent):
                     # Fallback: alternate if no good positioning action
                     if has_action5:
                         a = GameAction.ACTION5
-                        a.reasoning = {"why": "v27-click-position-approach", "hot_cell": self.hot_cell}
+                        a.reasoning = {"why": "v29-click-position-approach", "hot_cell": self.hot_cell}
                         self.prev_action = a
                         self.prev_grid = grid
                         self.click_idx += 1
                         return a
                     elif has_action7:
                         a = GameAction.ACTION7
-                        a.reasoning = {"why": "v27-click-position-approach", "hot_cell": self.hot_cell}
+                        a.reasoning = {"why": "v29-click-position-approach", "hot_cell": self.hot_cell}
                         self.prev_action = a
                         self.prev_grid = grid
                         self.click_idx += 1
@@ -808,14 +808,14 @@ class MyAgent(Agent):
                     # This helps find the hot cell faster from life 0
                     if has_action5:
                         a = GameAction.ACTION5
-                        a.reasoning = {"why": "v27-click-spiral-position", "click_idx": self.click_idx}
+                        a.reasoning = {"why": "v29-click-spiral-position", "click_idx": self.click_idx}
                         self.prev_action = a
                         self.prev_grid = grid
                         self.click_idx += 1
                         return a
                     elif has_action7:
                         a = GameAction.ACTION7
-                        a.reasoning = {"why": "v27-click-spiral-position", "click_idx": self.click_idx}
+                        a.reasoning = {"why": "v29-click-spiral-position", "click_idx": self.click_idx}
                         self.prev_action = a
                         self.prev_grid = grid
                         self.click_idx += 1
@@ -867,7 +867,7 @@ class MyAgent(Agent):
             for alt in (GameAction.ACTION5, GameAction.ACTION7):
                 if alt in avail:
                     a = alt
-                    a.reasoning = {"why": "v27-click-fallback-position"}
+                    a.reasoning = {"why": "v29-click-fallback-position"}
                     self.prev_action = a
                     self.prev_grid = grid
                     return a
@@ -885,7 +885,7 @@ class MyAgent(Agent):
             if next_action and next_action in movable:
                 self.path_index += 1
                 a = next_action
-                a.reasoning = {"why": "v25-asymmetric-bfs", "path_index": self.path_index, "path_len": len(self.path_to_goal)}
+                a.reasoning = {"why": "v29-asymmetric-bfs", "path_index": self.path_index, "path_len": len(self.path_to_goal)}
                 self.prev_action = a
                 self.path.append(a)
                 self.prev_grid = grid
@@ -904,7 +904,7 @@ class MyAgent(Agent):
             # Use ONLY the single highest magnitude action (ACTION5-7 typically)
             best_act = sorted_actions[0]
             a = best_act
-            a.reasoning = {"why": "v25-asymmetric-exclusive-max", "magnitude": self.action_magnitude[best_act.value], "alternatives": [x.value for x in sorted_actions[1:3]]}
+            a.reasoning = {"why": "v29-asymmetric-exclusive-max", "magnitude": self.action_magnitude[best_act.value], "alternatives": [x.value for x in sorted_actions[1:3]]}
             self.prev_action = a
             self.path.append(a)
             self.prev_grid = grid
@@ -959,7 +959,7 @@ class MyAgent(Agent):
         
         if best_action:
             a = best_action
-            a.reasoning = {"why": "v14-maze-explore", "score": best_score, "game_type": "maze"}
+            a.reasoning = {"why": "v29-maze-explore", "score": best_score, "game_type": "maze"}
             self.prev_action = a
             self.path.append(a)
             self.prev_grid = grid
@@ -998,7 +998,7 @@ class MyAgent(Agent):
             # --- STAGNATION BREAKOUT ---
             if self.stagnation > 6:
                 # For click games, reset click state more aggressively (after 7 stagnation, was 8)
-                if self.is_click_game and self.stagnation > 7:
+                if self.is_click_game:
                     # Keep hot_cell but reset click pattern
                     self.click_cells = []
                     # Spiral pattern from center for better coverage
@@ -1018,7 +1018,7 @@ class MyAgent(Agent):
                     for alt in (GameAction.ACTION5, GameAction.ACTION7):
                         if alt in movable:
                             a = alt
-                            a.reasoning = {"why": "v27-stagnation-click-position", "stagnation": self.stagnation}
+                            a.reasoning = {"why": "v29-stagnation-click-position", "stagnation": self.stagnation}
                             self.prev_action = a
                             self.path.append(a)
                             self.prev_grid = grid
@@ -1040,7 +1040,7 @@ class MyAgent(Agent):
                         self.path.append(a)
                         self.prev_grid = grid
                         self.stagnation = 0
-                        a.reasoning = {"why": "v27-stagnation-click-reset"}
+                        a.reasoning = {"why": "v29-stagnation-click-reset"}
                         return a
                 
                 # For asymmetric games, force use of highest magnitude action EXCLUSIVELY
@@ -1053,7 +1053,7 @@ class MyAgent(Agent):
                     cycle_act = sorted_mag[min(self.stagnation // 2, len(sorted_mag) - 1)][0]
                     for a in movable:
                         if a.value == cycle_act:
-                            a.reasoning = {"why": "v27-stagnation-exclusive-max-asymmetric", "stagnation": self.stagnation, "magnitude": self.action_magnitude[cycle_act]}
+                            a.reasoning = {"why": "v29-stagnation-asymmetric-cycle", "stagnation": self.stagnation, "magnitude": self.action_magnitude[cycle_act]}
                             self.prev_action = a
                             self.path.append(a)
                             self.prev_grid = grid
@@ -1070,7 +1070,7 @@ class MyAgent(Agent):
                         if next_action and next_action in movable:
                             self.path_index += 1
                             a = next_action
-                            a.reasoning = {"why": "v27-stagnation-maze-recompute", "stagnation": self.stagnation}
+                            a.reasoning = {"why": "v29-stagnation-maze-recompute", "stagnation": self.stagnation}
                             self.prev_action = a
                             self.path.append(a)
                             self.prev_grid = grid
@@ -1081,7 +1081,7 @@ class MyAgent(Agent):
                         max_mag = max(self.action_magnitude.values())
                         for a in movable:
                             if a.value in self.action_magnitude and self.action_magnitude[a.value] >= max_mag * 0.8 and a.value in (5, 6, 7):
-                                a.reasoning = {"why": "v27-stagnation-maze-reposition", "stagnation": self.stagnation, "magnitude": self.action_magnitude[a.value]}
+                                a.reasoning = {"why": "v29-stagnation-maze-reposition", "stagnation": self.stagnation, "magnitude": self.action_magnitude[a.value]}
                                 self.prev_action = a
                                 self.path.append(a)
                                 self.prev_grid = grid
@@ -1095,7 +1095,7 @@ class MyAgent(Agent):
                         best_act_val = max(high_mag_57.items(), key=lambda kv: kv[1])[0]
                         for a in movable:
                             if a.value == best_act_val:
-                                a.reasoning = {"why": "v27-stagnation-unknown-high-mag-57", "stagnation": self.stagnation, "magnitude": self.action_magnitude[best_act_val]}
+                                a.reasoning = {"why": "v29-stagnation-unknown-high-mag-57", "stagnation": self.stagnation, "magnitude": self.action_magnitude[best_act_val]}
                                 self.prev_action = a
                                 self.path.append(a)
                                 self.prev_grid = grid
@@ -1307,7 +1307,7 @@ class MyAgent(Agent):
             if self.probe_left:
                 act = self.probe_left.pop(0)
                 a = act
-                a.reasoning = {"why": "v14-probe", "step": self.steps, "life": self.lives}
+                a.reasoning = {"why": "v29-probe", "step": self.steps, "life": self.lives}
                 self.prev_action = a
                 self.path.append(a)
                 self.prev_grid = grid
