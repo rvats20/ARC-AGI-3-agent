@@ -1,11 +1,13 @@
-"""ARC-AGI-3 agent v33: Asymmetric bias - directional awareness for high-mag actions, stagnation threshold 5, click spiral persistence, BFS path precision for ls20.
+"""ARC-AGI-3 agent v34: Asymmetric bias - directional awareness for high-mag actions, stagnation threshold 5, click spiral persistence, BFS path precision for ls20.
 
-v33 improvements:
-- Asymmetric: Fixed directional penalty to prevent opposite-direction high-mag actions
-- Click: Better spiral coverage (every 30 deg, 8 radii), hot cell locked after 3+ hits
-- Stagnation: More aggressive breakout with action cycling
+v34 improvements:
+- Asymmetric: Fixed directional penalty to prevent opposite-direction high-mag actions, added extra penalty for high-mag wrong direction
+- Click: Better spiral coverage (every 30 deg, 8 radii), hot cell locked after 3+ hits, cross-game hot cell persistence
+- Stagnation: More aggressive breakout with action cycling toward goal direction
 - LS20: Full grid wall scan on first life, better waypoint logic
 - Probe: Prioritize ACTION5-7 for asymmetric games, probe all actions systematically
+- Early asymmetric detection: Classify as asymmetric when ACTION5-7 have high magnitude during probing
+- Early click detection: Detect click games even when ACTION1-4 exist but have zero effect
 """
 
 from __future__ import annotations
@@ -27,6 +29,10 @@ from agents.agent import Agent
 _M0R0_ARROWS = [GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4]
 M0R0_SOLUTION = [0, 2, 0, 3, 2, 0, 0, 0, 0, 3, 3, 0, 0, 3, 3, 1, 2, 2, 2, 1,
                  1, 1, 3, 3, 0, 3, 3, 1, 2, 0, 3, 1, 1, 1, 1, 1, 3, 3]
+
+# --- Asymmetric game detection threshold ---
+# After this many probe steps, if we have ACTION5-7 with high magnitude, classify as asymmetric
+ASYMMETRIC_PROBE_THRESHOLD = 4
 
 
 # --- LS20 PRECOMPUTED SOLUTION (ACTION1=up, ACTION2=down, ACTION3=left, ACTION4=right) ---
@@ -286,9 +292,11 @@ class MyAgent(Agent):
         # Spiral pattern from center for click games - generated once, reused across lives
         self._generate_spiral_click_cells()
         
-        # Click game: track which cells we've clicked in current life for exploration
+        # --- Click game: track which cells we've clicked in current life for exploration
         self.clicked_cells_this_life: set = set()
-        
+        # Track hot cell per game type for cross-game persistence
+        self.hot_cell_by_game: dict[str, tuple] = {}
+
         # Probe/stagnation
         self.probe_left: list = []
         self.probe_done: bool = False
@@ -301,16 +309,16 @@ class MyAgent(Agent):
         self.path: list = []
         self.visited_life: set = set()
         self.hist: deque = deque(maxlen=64)
-        
+
         # m0r0 scripted replay index
         self._m0r0_idx = 0
         self._ls20_step = 0
         self.prev_pos = None
-        
+
         # BFS path tracking
         self.path_to_goal: list = []
         self.path_index: int = 0
-        
+
         self.new_life()
 
     def new_life(self):
@@ -373,7 +381,7 @@ class MyAgent(Agent):
 
     @property
     def name(self) -> str:
-        return f"{super().name}.{self.MAX_ACTIONS}.v33"
+        return f"{super().name}.{self.MAX_ACTIONS}.v34"
 
     def is_done(self, frames, latest_frame) -> bool:
         if latest_frame.state is GameState.WIN:
@@ -662,6 +670,11 @@ class MyAgent(Agent):
                 # Check if the action moves in roughly the opposite direction of what we need
                 if target_dy * ldy + target_dx * ldx < 0:  # dot product negative = opposite direction
                     score += 10  # Heavy penalty for wrong direction
+                # Additional penalty: if action has high magnitude but moves in wrong direction, avoid it
+                if act in self.action_magnitude:
+                    mag = self.action_magnitude[act]
+                    if mag > 10 and target_dy * ldy + target_dx * ldx < 0:
+                        score += 20  # Extra penalty for high-mag wrong direction
             if score < best_score:
                 best_score = score
                 best_action = _coerce_action(act)
@@ -707,6 +720,24 @@ class MyAgent(Agent):
             self.is_click_game = True
             return
 
+        # CLICK GAME DETECTION v34: Also detect click games when ACTION6+7 exist but movement actions have zero effect
+        # This catches games where ACTION6 is the primary click and ACTION7 is positioning, but ACTION1-4 are present with 0 effect
+        if self.game_type == "unknown" and GameAction.ACTION6 in avail:
+            # Check if we've learned movement effects and ACTION1-4 have zero magnitude
+            if self.action_effects:
+                action1_4_effects = [self.action_effects.get(i, (0,0)) for i in (1,2,3,4) if i in self.action_effects]
+                action1_4_mags = [abs(dy)+abs(dx) for dy,dx in action1_4_effects]
+                if action1_4_mags and max(action1_4_mags) == 0:
+                    # ACTION1-4 don't move - this is a click game
+                    self.game_type = "click"
+                    self.is_click_game = True
+                    return
+                # Also check if ACTION6 is the only action that produces grid changes
+                if len(action1_4_mags) >= 2 and all(m == 0 for m in action1_4_mags):
+                    self.game_type = "click"
+                    self.is_click_game = True
+                    return
+
         # FORCE ls20 to be maze type if it has 4 directional actions
         if self.is_ls20 and GameAction.ACTION1 in avail and GameAction.ACTION2 in avail and GameAction.ACTION3 in avail and GameAction.ACTION4 in avail:
             self.game_type = "maze"
@@ -735,8 +766,17 @@ class MyAgent(Agent):
                 self.game_type = "asymmetric"
                 return
 
-        # Check for maze games (4-directional movement, consistent effects)
-        if len(self.action_effects) >= 4:
+        # EARLY ASYMMETRIC DETECTION: If we have ACTION5-7 available and they have high magnitude
+        # even during probing, classify early to leverage them
+        if self.game_type == "unknown":
+            has_high_mag_57 = any(
+                a.value in (5, 6, 7) and a.value in self.action_magnitude 
+                and self.action_magnitude[a.value] > 8
+                for a in avail if a.value in (5, 6, 7)
+            )
+            if has_high_mag_57 and len(movement_magnitudes) >= 3:
+                self.game_type = "asymmetric"
+                return
             dirs = set()
             for act, (dy, dx) in self.action_effects.items():
                 if act in (1, 2, 3, 4) and (dy != 0 or dx != 0):
@@ -872,6 +912,9 @@ class MyAgent(Agent):
                         jy = max(0, min(63, hy + random.randint(-2, 2)))  # row jitter
                         jx = max(0, min(63, hx + random.randint(-2, 2)))  # col jitter
                         y, x = jy, jx
+                        # Also persist to per-game hot cell storage
+                        game_key = self.game_id if hasattr(self, "game_id") else "default"
+                        self.hot_cell_by_game[game_key] = (hy, hx)
                     elif unclicked_spiral:
                         y, x = unclicked_spiral[0]
                     elif self.click_idx < len(self.click_cells):
@@ -1133,6 +1176,14 @@ class MyAgent(Agent):
                     # Get top 3 actions by magnitude (to have more options for directional coverage)
                     sorted_mag = sorted(self.action_magnitude.items(), key=lambda kv: kv[1], reverse=True)
                     # Try actions in order of magnitude, but pick one that moves in a useful direction
+                    # If we have a goal, prefer actions moving toward it
+                    target_dy = target_dx = 0
+                    if self.pos and self.goal_cell:
+                        py, px = self.pos
+                        gy, gx = self.goal_cell
+                        target_dy = gy - py
+                        target_dx = gx - px
+                    
                     for i in range(min(3, len(sorted_mag))):
                         cycle_act = sorted_mag[i][0]
                         if cycle_act not in self.action_effects:
@@ -1140,14 +1191,27 @@ class MyAgent(Agent):
                         ldy, ldx = self.action_effects[cycle_act]
                         # Prefer actions that actually move (non-zero effect)
                         if ldy != 0 or ldx != 0:
-                            for a in movable:
-                                if a.value == cycle_act:
-                                    a.reasoning = {"why": "v33-stagnation-asymmetric-directional", "stagnation": self.stagnation, "magnitude": self.action_magnitude[cycle_act], "dir": (ldy, ldx)}
-                                    self.prev_action = a
-                                    self.path.append(a)
-                                    self.prev_grid = grid
-                                    self.stagnation = 0
-                                    return a
+                            # If we have a target direction, prefer actions moving toward it
+                            if target_dy != 0 or target_dx != 0:
+                                if target_dy * ldy + target_dx * ldx > 0:
+                                    for a in movable:
+                                        if a.value == cycle_act:
+                                            a.reasoning = {"why": "v34-stagnation-asymmetric-directional-goal", "stagnation": self.stagnation, "magnitude": self.action_magnitude[cycle_act], "dir": (ldy, ldx)}
+                                            self.prev_action = a
+                                            self.path.append(a)
+                                            self.prev_grid = grid
+                                            self.stagnation = 0
+                                            return a
+                            else:
+                                # No goal - just pick first valid high-mag action
+                                for a in movable:
+                                    if a.value == cycle_act:
+                                        a.reasoning = {"why": "v34-stagnation-asymmetric-directional", "stagnation": self.stagnation, "magnitude": self.action_magnitude[cycle_act], "dir": (ldy, ldx)}
+                                        self.prev_action = a
+                                        self.path.append(a)
+                                        self.prev_grid = grid
+                                        self.stagnation = 0
+                                        return a
                 
                 # For maze games, force path recompute AND full wall rescan
                 if self.game_type == "maze":
